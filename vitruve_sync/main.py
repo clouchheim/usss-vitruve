@@ -64,6 +64,8 @@ def run():
         vitruve_user = vitruve_users_by_id.get(workout.get("userId"))
         if vitruve_user is None:
             counts["vitruve_user_not_found"] += 1
+            unit_id = compute_unit_id(workout, exercise)
+            log(f"  UNMATCHED (vitruve_user_not_found): vitruve userId={workout.get('userId')} unit={unit_id}")
             continue
 
         teamworks_user_id, match_status = match_athlete(vitruve_user, name_index)
