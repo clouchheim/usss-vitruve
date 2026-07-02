@@ -7,15 +7,29 @@ dedicated Vitruve VBT form.
 ## Status
 
 Conceptual plan agreed and restructured against real API docs for both sides
-(see source docs below, all checked into repo root). Still waiting on the
-actual Teamworks VBT form field layout — the user is designing that form based
-on the recommendations in this file plus the real shape of a live Vitruve
-pull, so the transform section below is a recommendation to validate against
-the form once built, not a final spec.
+(see source docs below, all checked into repo root), then refined again
+against a real `/vbt-workouts` sample pull cross-referenced with Vitruve's own
+website CSV export for one athlete's morning sessions. That cross-reference
+surfaced several structural findings (see "Learnings from first real sample"
+below) that changed the row-granularity, dedup-key, and athlete-matching
+recommendations from the first pass. Still waiting on the actual Teamworks VBT
+form field layout — the user is designing that form based on the
+recommendations in this file plus the real shape of a live Vitruve pull, so
+the transform section below is a recommendation to validate against the form
+once built, not a final spec.
 
 Nothing has been implemented yet beyond a diagnostic script
 (`scripts/pull_vitruve_last_week.py`, read-only, Vitruve side only) used to
 capture a real sample response for testing.
+
+**Note on sample data realism:** the CSV/JSON sample pulled so far has
+implausible magnitudes for force/power/weight fields (e.g. "Mean Force"
+~1 N, "Weight" ~0.1 kg on a squat) — consistent with this being Vitruve
+sandbox/demo data rather than physiologically real numbers (the API docs'
+own example `/users` response uses celebrity names, so a demo org is
+plausible). Treat the *structural* findings below as reliable; don't read
+sports-science meaning into the specific numeric values until we're pointed
+at production data.
 
 Source docs in repo root:
 - `vitruve_api_docs.pdf` — Vitruve Exports API
@@ -127,22 +141,91 @@ custom label).
   (e.g. `TEAMWORKS_USERNAME` / `TEAMWORKS_PASSWORD`), scoped to read/write
   only the Vitruve VBT form plus roster-read (see caveat above).
 - **State persistence**: no external DB — plan is to commit a small JSON
-  state file (processed `(workoutId, exerciseId)` pairs) back to the repo
-  after each successful run. Vitruve workouts are "completed" records, so
-  treating them as immutable once seen (skip rather than update) is the
-  simplest correct behavior for v1 — see Dedup section.
+  state file back to the repo after each successful run, keyed by (athlete,
+  workout, exercise) unit and storing the imported concentric repetition IDs
+  plus the `existingEventId` Teamworks returned, to support the
+  skip-if-unchanged / resend-full-state-if-new-reps-appear logic — see Dedup
+  section (updated after the first real sample pull surfaced a case where a
+  workout's contents can't be assumed complete/final at first sight).
 
-## Athlete matching — leaning B as source of truth, A as reconciliation
+## Athlete matching — leaning A as primary now, given real sample evidence
 
 | Approach | How | Tradeoff |
 |---|---|---|
 | A. Live match via `/users` | Match Vitruve `/users` to Teamworks roster (`usersynchronise`) by email each run | Self-maintaining, but depends on email consistency between systems, and Teamworks' user-object field names/shape aren't documented until we test live |
 | B. Hardcoded mapping form | Separate Teamworks form: `vitruveUserId → teamworksAthleteId`, maintained manually | No fuzzy-matching risk, needs manual upkeep |
 
-Still leaning **B as source of truth, A as a periodic reconciliation report**
-(Vitruve users with no mapping row) — reinforced by the field notes' general
-guidance to prefer a stable ID over name/email matching wherever the source
-data supports it. Final call still pending real data from both systems.
+**Updated after seeing a real sample:** the website CSV export shows Vitruve
+stores the athlete's real `@usskiandsnowboard.org` work email against their
+profile, not a personal/third-party address. That's a strong signal email
+matching against Teamworks will work cleanly, since it's presumably the same
+address used for the athlete's Teamworks account. Leaning **A (live email
+match) as primary now, B (mapping form) as a manual-override list for
+whoever doesn't match** — flipped from the original lean, pending
+confirmation that Teamworks' `usersynchronise` user objects actually expose
+an email field (unconfirmed — the OpenAPI excerpt we have documents the sync
+envelope but not the per-user object shape; needs a live test call). If email
+turns out to be missing or unreliable on the Teamworks side, fall back to B
+as primary.
+
+## Learnings from first real sample (`/vbt-workouts?date=last-7days` + website CSV export)
+
+Cross-referenced a real API pull against the human-facing CSV export Vitruve's
+website generates for the same two sessions, for one athlete. This confirmed
+some assumptions and overturned others:
+
+1. **The CSV export — what a coach actually looks at — only ever contains
+   `Type* = concentric` rows.** Eccentric-phase data exists in the raw API
+   (`repetitions[]` entries with `"type": "eccentric"`) but Vitruve's own
+   default export drops it entirely. The CSV's `# Rep.` numbering (rep 1, 2,
+   3...) counts concentric reps only.
+2. **Concentric and eccentric are separate `repetitions[]` entries, not a
+   paired concentric+eccentric reading per physical rep**, and pairing is
+   **not reliably 1:1 or alternating** — real series were observed with a
+   trailing unpaired eccentric, and back-to-back eccentric entries with no
+   concentric between them. Treating "one physical rep" as "one concentric
+   entry, ignore eccentric" sidesteps this pairing ambiguity entirely and
+   matches what coaches already see in the CSV.
+3. **Metric vocabulary is confirmed and enumerable.** Concentric reps carry
+   27 distinct metrics, eccentric reps carry a 22-metric subset (missing
+   `1RM`, `1RM / Body Weight`, and the three `Fatigue` metrics — all
+   concentric-phase-only concepts). The metric name strings in the API
+   response match the CSV column headers exactly, minus the parenthetical
+   unit suffix (e.g. API `"Mean Propulsive Velocity"` ↔ CSV `"Mean
+   Propulsive Velocity (m/s)"`) — the CSV headers are a reliable, complete
+   reference for the full metric-to-AMS-field mapping table:
+   `1RM`, `1RM / Body Weight`, `Acceleration Index`, `Fatigue (PV)`,
+   `Fatigue [MPV]`, `Fatigue [MV]`, `Jump Contact Time`, `Jump Contraction
+   Time`, `Jump Flight Time`, `Jump Height`, `Jump Modified RSI`, `Jump Net
+   Impulse`, `Jump Positive Impulse`, `Jump RSI`, `Mean Acceleration`, `Mean
+   Force`, `Mean Force / Body Weight`, `Mean Power [MPV]`, `Mean Power [MV]`,
+   `Mean Power / Body Weight [MPV]`, `Mean Power / Body Weight [MV]`, `Mean
+   Propulsive Velocity`, `Mean Velocity`, `Peak Acceleration`, `Peak Force`,
+   `Peak Force / Body Weight`, `Peak Power`, `Peak Power / Body Weight`,
+   `Peak Velocity`, `Peak Velocity / Body Weight`, `Repetition Duration`,
+   `ROM (Range of Motion)`, `Time to Peak Velocity`, `Weight`, `Weight / Body
+   Weight`.
+4. **Metric applicability varies by exercise type** — jump-specific metrics
+   (`Jump Height`, `Jump Flight Time`, etc.) and load-based metrics (`1RM`,
+   `Fatigue`) are blank unless the exercise/rig supports them (e.g. no force
+   plate, or a bodyweight exercise with no external load). The AMS table
+   needs to tolerate blank cells per row — this is normal, not a data defect.
+5. **A Vitruve `series` corresponds to a `# Set` in the CSV** — one series =
+   one continuous recorded set. Use it directly as a "Set #" column rather
+   than inventing a different aggregation.
+6. **Important data-quality finding: a Vitruve "workout" is not guaranteed to
+   be a single-day session.** The athlete's own two sessions were clean
+   (each `workout.startedAt`/`completedAt` same day, matching what they
+   actually did), but a different workout in the same pull had exercises
+   whose `series[].completedAt` timestamps spanned multiple calendar days
+   under one `completedAt`-marked-"completed" workout. **Do not trust
+   workout-level `startedAt`/`completedAt` as the event date — derive it from
+   the exercise's own series `completedAt` timestamps instead**, and treat
+   any exercise whose series span more than one calendar day as a
+   data-quality anomaly to log/alert on rather than something to silently
+   resolve — this may be stale/left-open workout data, or possibly seeded
+   demo data, not a case worth building complex cross-day-splitting logic
+   for in v1.
 
 ## Transform — recommendation to validate against the real form
 
@@ -150,16 +233,27 @@ Now that we know `eventimport`'s actual shape (single-value fields in row 0 +
 one repeating table), that structure maps cleanly onto the Vitruve nesting if
 we pick the right unit of "one event":
 
-**Recommendation: one `eventimport` call per (athlete, workout, exercise).**
+**Recommendation: one `eventimport` call per (athlete, workout, exercise),
+concentric reps only.**
 - Event-level fields (row 0): Vitruve workout ID, exercise name, session
-  date/time (from `completedAt`/`startedAt`) — these are genuinely
+  date/time (derived from the exercise's own series `completedAt`, per
+  finding 6 above, not the workout-level timestamps) — these are genuinely
   single-valued per exercise performed in a session.
-- Repeating table: **one row per repetition** — columns for series/set
-  number, rep number, rep type (concentric/eccentric), plus one column per
-  known Vitruve metric name (fixed mapping, e.g. `"Mean Propulsive Velocity"`
-  → an AMS field). Rep-level preserves full fidelity and AMS tables handle
-  arbitrary row counts fine, so there's no technical reason to pre-aggregate
-  to set-level unless the form is intentionally designed coarser.
+- Repeating table: **one row per concentric repetition** — columns for Set #
+  (`series` index, per finding 5), Rep # (concentric-only sequence number,
+  matching the CSV's own numbering so it reads the same as what coaches
+  already see on the Vitruve site), plus one column per known Vitruve
+  concentric metric name (fixed mapping, see the 27-metric list above).
+  Rep-level preserves full fidelity and AMS tables handle arbitrary row
+  counts fine, so there's no technical reason to pre-aggregate to set-level
+  unless the form is intentionally designed coarser.
+- **Eccentric data: recommend leaving it out of the AMS form for v1.**
+  VBT methodology is built around the concentric (lifting) phase — that's
+  what load-velocity profiling and velocity-based load prescription actually
+  use — and Vitruve's own default coach-facing export already excludes it.
+  Importing it would also mean solving the unreliable pairing problem from
+  finding 2 for no clear payoff yet. Worth revisiting only if coaches
+  specifically want eccentric velocity/duration for a particular protocol.
 - This keeps event count bounded (one event per exercise actually performed,
   not per rep) while avoiding the "3,000+ stray events" failure mode from the
   prior integration, and it doesn't violate the single-value-field-per-row-0
@@ -173,7 +267,8 @@ Open until the form exists:
 - Exact metric-name → AMS-field-name mapping, sourced from the real form once
   built (`GET /api/v3/forms/{form_type}/{form_id}` can return authoritative
   field names later, but that's a v3/session-auth endpoint — useful as a
-  build-time verification step, not required for v1).
+  build-time verification step, not required for v1). The 27-metric
+  concentric list above is the candidate source list to map from.
 - Any metric name encountered that isn't in the mapping should be
   logged/alerted on, not silently dropped.
 
@@ -195,14 +290,28 @@ Open until the form exists:
 
 ## Dedup / idempotency
 
-- Vitruve workouts are immutable once completed (no evidence of an update
-  path in their API), so v1 dedup is **skip if already imported**: maintain
-  the committed state file of `(workoutId, exerciseId)` pairs already
-  successfully written, and never re-submit them — no need to track
-  `existingEventId` per unit for routine runs.
-- `existingEventId`-based update is a possible future extension only if
-  Vitruve is ever observed to mutate a "completed" workout's data
-  retroactively — not needed for the initial build.
+- **Updated: track dedup state at the repetition level, not (workoutId,
+  exerciseId).** The multi-day-workout finding above means a given
+  `(workoutId, exerciseId)` pair isn't guaranteed to have a stable, complete
+  set of repetitions the first time it's seen — content could still be
+  accumulating under that same workout ID. Tracking at the individual
+  repetition-ID level (globally unique, immutable once it exists) is safe
+  regardless of how upstream workout/series grouping behaves.
+- Per (athlete, workout, exercise) unit: before building the event, check
+  whether every concentric repetition ID for that unit is already in the
+  committed state file.
+  - All already seen → skip entirely, nothing changed.
+  - Any new → rebuild the **full** current row set (previously-imported reps
+    + new ones) and submit via `existingEventId` if we have one on file for
+    this unit, since `eventimport` update replaces rather than merges (see
+    Teamworks API notes above) — a partial resend would drop the
+    previously-imported rows.
+- This also naturally handles the ordinary (non-anomalous) case of an
+  athlete doing the same exercise twice in one day under two different
+  workout records, without extra logic.
+- `existingEventId` returned from each successful `eventimport` call needs
+  to be persisted in the state file per (athlete, workout, exercise) unit to
+  support this update path.
 
 ## Credentials
 
