@@ -142,31 +142,37 @@ custom label).
   only the Vitruve VBT form plus roster-read (see caveat above).
 - **State persistence**: no external DB — plan is to commit a small JSON
   state file back to the repo after each successful run, keyed by (athlete,
-  workout, exercise) unit and storing the imported concentric repetition IDs
-  plus the `existingEventId` Teamworks returned, to support the
-  skip-if-unchanged / resend-full-state-if-new-reps-appear logic — see Dedup
-  section (updated after the first real sample pull surfaced a case where a
-  workout's contents can't be assumed complete/final at first sight).
+  workout, exercise) unit and storing all imported repetition IDs (both
+  concentric and eccentric, per the finalized form) plus the
+  `existingEventId` Teamworks returned, to support the skip-if-unchanged /
+  resend-full-state-if-new-reps-appear logic — see Dedup section (updated
+  after the first real sample pull surfaced a case where a workout's
+  contents can't be assumed complete/final at first sight).
 
-## Athlete matching — leaning A as primary now, given real sample evidence
+## Athlete matching — settled on name-cascade, given a real `/users` pull
 
 | Approach | How | Tradeoff |
 |---|---|---|
 | A. Live match via `/users` | Match Vitruve `/users` to Teamworks roster (`usersynchronise`) by email each run | Self-maintaining, but depends on email consistency between systems, and Teamworks' user-object field names/shape aren't documented until we test live |
 | B. Hardcoded mapping form | Separate Teamworks form: `vitruveUserId → teamworksAthleteId`, maintained manually | No fuzzy-matching risk, needs manual upkeep |
+| C. Name-cascade | Match Vitruve `/users` `name`/`surname` to Teamworks `usersynchronise` first/last name | Same fragility class the prior integration already hit and documented a fix for (see below) |
 
-**Updated after seeing a real sample:** the website CSV export shows Vitruve
-stores the athlete's real `@usskiandsnowboard.org` work email against their
-profile, not a personal/third-party address. That's a strong signal email
-matching against Teamworks will work cleanly, since it's presumably the same
-address used for the athlete's Teamworks account. Leaning **A (live email
-match) as primary now, B (mapping form) as a manual-override list for
-whoever doesn't match** — flipped from the original lean, pending
-confirmation that Teamworks' `usersynchronise` user objects actually expose
-an email field (unconfirmed — the OpenAPI excerpt we have documents the sync
-envelope but not the per-user object shape; needs a live test call). If email
-turns out to be missing or unreliable on the Teamworks side, fall back to B
-as primary.
+**Updated after pulling the real `/users` endpoint:** contrary to the docs'
+example response, the actual org's `/users` records only carry `id`, `name`,
+`surname` — **no `email` field is present.** That kills approach A as primary
+(there's nothing reliable to join on) and the org confirmed we'll match on
+name instead. This is exactly the scenario `AMS_EVENTIMPORT_NOTES.md` already
+covers from the prior AMS integration, so reuse its cascade rather than
+re-deriving it: exact last name (case-insensitive) → narrow by first initial
+→ narrow by full first name. Know its limits going in — no fuzzy matching, no
+accent/unicode normalization, no handling of hyphens/middle names/suffixes,
+and a genuine duplicate name in the org produces an ambiguous "no unique
+match," not a wrong-but-silent one. **Approach B (manual mapping form) is the
+fallback for anything the cascade can't resolve uniquely** — surface those
+cases for a human to resolve rather than guessing. If a Teamworks user object
+ever does turn out to expose an email field once we test `usersynchronise`
+live, prefer it as a first-pass opportunistic match before falling through to
+the name cascade, but don't design around it being there.
 
 ## Learnings from first real sample (`/vbt-workouts?date=last-7days` + website CSV export)
 
@@ -227,59 +233,67 @@ some assumptions and overturned others:
    demo data, not a case worth building complex cross-day-splitting logic
    for in v1.
 
-## Transform — recommendation to validate against the real form
+## Transform — finalized against the real "Vitruve VBT" form
 
-Now that we know `eventimport`'s actual shape (single-value fields in row 0 +
-one repeating table), that structure maps cleanly onto the Vitruve nesting if
-we pick the right unit of "one event":
+The form now exists in Teamworks. Actual field list:
 
-**Recommendation: one `eventimport` call per (athlete, workout, exercise),
-concentric reps only.**
-- Event-level fields (row 0): Vitruve workout ID, exercise name, session
-  date/time (derived from the exercise's own series `completedAt`, per
-  finding 6 above, not the workout-level timestamps) — these are genuinely
-  single-valued per exercise performed in a session.
-- Repeating table: **one row per concentric repetition** — columns for Set #
-  (`series` index, per finding 5), Rep # (concentric-only sequence number,
-  matching the CSV's own numbering so it reads the same as what coaches
-  already see on the Vitruve site), plus one column per known Vitruve
-  concentric metric name (fixed mapping, see the 27-metric list above).
-  Rep-level preserves full fidelity and AMS tables handle arbitrary row
-  counts fine, so there's no technical reason to pre-aggregate to set-level
-  unless the form is intentionally designed coarser.
-- **Eccentric data: recommend leaving it out of the AMS form for v1.**
-  VBT methodology is built around the concentric (lifting) phase — that's
-  what load-velocity profiling and velocity-based load prescription actually
-  use — and Vitruve's own default coach-facing export already excludes it.
-  Importing it would also mean solving the unreliable pairing problem from
-  finding 2 for no clear payoff yet. Worth revisiting only if coaches
-  specifically want eccentric velocity/duration for a particular protocol.
-- This keeps event count bounded (one event per exercise actually performed,
-  not per rep) while avoiding the "3,000+ stray events" failure mode from the
-  prior integration, and it doesn't violate the single-value-field-per-row-0
-  rule since exercise/date genuinely don't vary within one exercise's data.
+- **Non-table (row 0) field:** `Exercise Name` — the only event-level field.
+  Session date/time is *not* a form field; it's carried on the top-level
+  `eventimport` payload (`startDate`/`finishDate`/`startTime`), derived from
+  the exercise's series `completedAt` per finding 6 above, not workout-level
+  timestamps.
+- **Table fields:** `Type` (concentric/eccentric), `Set.` (see below), plus
+  22 metric columns, each named exactly `f"{metric} ({unit})"` using
+  Vitruve's own metric/unit strings — e.g. `Mean Propulsive Velocity (m/s)`,
+  `Mean Power [MPV] (W)`. This is the full 22-metric vocabulary shared by
+  both concentric and eccentric reps (confirmed against the 27/22 lists
+  above) — **currently excludes 13 concentric-only/jump-only metrics**:
+  `1RM`, `1RM / Body Weight`, the three `Fatigue` metrics, and all 8
+  `Jump *` metrics. These aren't hypothetical gaps — the sampled squat data
+  already had real `1RM`/`1RM / Body Weight` values on some concentric reps
+  that would silently vanish with no error, since a missing column and a
+  blank cell look identical from the API's perspective. Given the stated
+  design principle ("no harm in extra fields, harm in missing ones"), worth
+  adding these 13 now while the form is still being built, rather than
+  discovering the gap later from a loaded lift or a jump-mat session.
 
-Open until the form exists:
-- Confirm this granularity against the actual field list the user designs —
-  if the form is intentionally coarser (e.g. set-level aggregates only), the
-  table-row mapping changes but the event-per-exercise boundary likely still
-  holds.
-- Exact metric-name → AMS-field-name mapping, sourced from the real form once
-  built (`GET /api/v3/forms/{form_type}/{form_id}` can return authoritative
-  field names later, but that's a v3/session-auth endpoint — useful as a
-  build-time verification step, not required for v1). The 27-metric
-  concentric list above is the candidate source list to map from.
-- Any metric name encountered that isn't in the mapping should be
-  logged/alerted on, not silently dropped.
+**Finalized shape: one `eventimport` call per exercise entry, one table row
+per repetition (concentric AND eccentric, not concentric-only as originally
+recommended).** Tagging each row with `Type` sidesteps the eccentric/
+concentric pairing ambiguity from finding 2 entirely — rows are a straight
+1:1 flatten of the `repetitions[]` array, no pairing logic needed.
+
+**`Set.` numbering:** raw `series` UUIDs aren't meaningful to a coach, so
+assign ascending integers per exercise (1, 2, 3...) by sorting that
+exercise's `series` by `completedAt` and numbering in order — every
+repetition row carries its parent series' number. Sorting explicitly by
+`completedAt` (rather than trusting raw API array order) is a cheap
+safeguard even though the two are likely already the same.
+
+**Metric-key safety:** only ever emit a `pairs` entry for a metric whose
+`f"{metric} ({unit})"` string is a known, confirmed form column. An
+unrecognized metric name should be logged/alerted on, not silently dropped
+*or* sent as an unknown key — untested what `eventimport` does with a `key`
+that has no matching form field, so don't rely on it being harmless. Worth
+confirming empirically during the first smoke test (send one row with a
+deliberately-unknown key and see what comes back).
+
+Per-repetition metric presence is confirmed to vary at the **individual
+repetition** level, not just by concentric/eccentric type — two reps of the
+same type and exercise can have different subsets of `metricValues` present
+(e.g. `Mean Acceleration` shows up on some concentric reps but not others in
+the same series). The transform must check what's actually present per rep,
+never assume a fixed set per `Type`.
 
 ## Load into Teamworks AMS
 
 - `POST /api/v1/eventimport`, Basic Auth, `X-APP-ID` header identifying this
   integration (e.g. `usss.vitruve-integration.v1`).
 - One call per (athlete, workout, exercise) unit per the transform section
-  above — never split a single event's event-level fields and table across
-  multiple calls, and never call twice against the same `existingEventId`
-  expecting a merge.
+  above (all repetitions, concentric and eccentric, tagged by `Type`) —
+  never split a single event's event-level fields and table across multiple
+  calls, and never call twice against the same `existingEventId` expecting
+  a merge.
 - Always parse the response body; success is `state ==
   "SUCCESSFULLY_IMPORTED"` (allowlist, not blocklist). Any other state, or a
   transport-level error, counts as a write failure for observability
@@ -298,8 +312,8 @@ Open until the form exists:
   repetition-ID level (globally unique, immutable once it exists) is safe
   regardless of how upstream workout/series grouping behaves.
 - Per (athlete, workout, exercise) unit: before building the event, check
-  whether every concentric repetition ID for that unit is already in the
-  committed state file.
+  whether every repetition ID for that unit (concentric and eccentric — the
+  form now includes both) is already in the committed state file.
   - All already seen → skip entirely, nothing changed.
   - Any new → rebuild the **full** current row set (previously-imported reps
     + new ones) and submit via `existingEventId` if we have one on file for
@@ -344,11 +358,14 @@ Open until the form exists:
 `AMS_EVENTIMPORT_NOTES.md` points to `mocap_report_gui/smartabase_client.py`
 in the `usss-mocap` repo as a working reference for v1 auth, paginated user
 lookup, and event submission (`_headers`, `_fetch_all_athletes`,
-`get_athlete_id`, `_post_event`). This session's GitHub access is scoped only
-to `usss-vitruve`, so that file hasn't been pulled in directly — worth asking
+`get_athlete_id`, `_post_event`). `get_athlete_id` specifically is now
+directly relevant, not just a pattern to imitate — it already implements the
+same last-name → first-initial → full-first-name cascade we just settled on
+for athlete matching. This session's GitHub access is scoped only to
+`usss-vitruve`, so that file hasn't been pulled in directly — worth asking
 the user to copy the relevant functions over (or grant access) once we start
 writing the Teamworks client, rather than re-deriving the same
-already-solved auth/pagination code.
+already-solved auth/pagination/matching code.
 
 ## Org tooling context
 
