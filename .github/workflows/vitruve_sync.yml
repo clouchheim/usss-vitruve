@@ -1,0 +1,44 @@
+name: Vitruve to Teamworks sync
+
+on:
+  schedule:
+    # Every 30 minutes. Scheduled workflows only run on the repo's default
+    # branch - this won't fire until this workflow file is merged there.
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: vitruve-teamworks-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run sync
+        env:
+          API_KEY: ${{ secrets.API_KEY }}
+          A360_USER: ${{ secrets.A360_USER }}
+          A360_PASSWORD: ${{ secrets.A360_PASSWORD }}
+        run: python -m vitruve_sync.main
+
+      - name: Commit updated dedup state
+        run: |
+          if git diff --quiet -- state/dedup_state.json; then
+            echo "No state changes to commit"
+          else
+            git config user.name "vitruve-sync-bot"
+            git config user.email "actions@github.com"
+            git add state/dedup_state.json
+            git commit -m "Update Vitruve sync dedup state [skip ci]"
+            git push
+          fi
