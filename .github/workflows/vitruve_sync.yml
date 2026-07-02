@@ -4,7 +4,7 @@ on:
   schedule:
     # Every 30 minutes. Scheduled workflows only run on the repo's default
     # branch - this won't fire until this workflow file is merged there.
-    - cron: "*/30 * * * *"
+    - cron: "*/15 * * * *"
   workflow_dispatch: {}
 
 concurrency:
