@@ -31,6 +31,17 @@ Still open/unimplemented:
 Diagnostic script `scripts/pull_vitruve_last_week.py` (read-only, Vitruve
 side only) remains for capturing fresh samples if needed.
 
+Diagnostic script `scripts/pull_teamworks_events.py` (read-only, Teamworks
+side only — calls `eventsearch` via the real `TeamworksClient`, never
+`eventimport`) exists specifically to verify the `eventsearch` shape
+assumption called out throughout this doc: run the real sync once via
+`workflow_dispatch`, then run this script with the resulting unit ids
+(`workoutId:exerciseId`, from the sync's own log lines) passed as
+`CANDIDATE_UNIT_IDS` to confirm `find_existing_unit_ids`'s extraction logic
+actually locates them in a live response, and inspect the saved raw JSON
+(`samples/teamworks-events-*.json`, gitignored) to see exactly where the
+`Vitruve ID` field lands in the real payload shape.
+
 **Note on sample data realism:** the CSV/JSON sample pulled so far has
 implausible magnitudes for force/power/weight fields (e.g. "Mean Force"
 ~1 N, "Weight" ~0.1 kg on a squat) — consistent with this being Vitruve
