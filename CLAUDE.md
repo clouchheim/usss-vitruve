@@ -6,21 +6,31 @@ dedicated Vitruve VBT form.
 
 ## Status
 
-Conceptual plan agreed and restructured against real API docs for both sides
-(see source docs below, all checked into repo root), then refined again
-against a real `/vbt-workouts` sample pull cross-referenced with Vitruve's own
-website CSV export for one athlete's morning sessions. That cross-reference
-surfaced several structural findings (see "Learnings from first real sample"
-below) that changed the row-granularity, dedup-key, and athlete-matching
-recommendations from the first pass. Still waiting on the actual Teamworks VBT
-form field layout — the user is designing that form based on the
-recommendations in this file plus the real shape of a live Vitruve pull, so
-the transform section below is a recommendation to validate against the form
-once built, not a final spec.
+**v1 implemented** (`vitruve_sync/` package + `.github/workflows/vitruve_sync.yml`,
+scheduled every 30 minutes). Built against the real "Vitruve VBT" form once
+it existed — see "Learnings from first real sample" and "Transform" below
+for how the design got there. Verified so far: 17 unit tests
+(`tests/`, synthetic fixtures only, no real athlete data) plus one full
+`main.run()` smoke test with mocked Vitruve/Teamworks clients confirming the
+whole pipeline — match, transform, write, dedup-skip-on-rerun, multi-day
+anomaly flagging, unrecognized-metric alerting. **Not yet verified against
+the real live APIs** — no credentials in the environment this was built in.
+See "Before turning the schedule on" below.
 
-Nothing has been implemented yet beyond a diagnostic script
-(`scripts/pull_vitruve_last_week.py`, read-only, Vitruve side only) used to
-capture a real sample response for testing.
+Still open/unimplemented:
+- Manual-mapping-form fallback (Approach B) for athletes the name match
+  can't resolve — currently just logged as `athlete_unmatched` /
+  `athlete_ambiguous_name` counts, not auto-resolved against a backup form.
+- Self-healing dedup reconciliation against Teamworks directly (via
+  `eventsearch`/`synchronise`) if the committed state file is ever lost —
+  deliberately not built blind against an undocumented response shape, see
+  "Dedup" below.
+- The 13 excluded metrics (1RM, Fatigue, Jump *) — add their AMS columns and
+  uncomment the matching keys in `vitruve_sync/transform.py`'s
+  `KNOWN_METRIC_FIELDS` once done.
+
+Diagnostic script `scripts/pull_vitruve_last_week.py` (read-only, Vitruve
+side only) remains for capturing fresh samples if needed.
 
 **Note on sample data realism:** the CSV/JSON sample pulled so far has
 implausible magnitudes for force/power/weight fields (e.g. "Mean Force"
@@ -327,18 +337,14 @@ never assume a fixed set per `Type`.
   exerciseId).** The multi-day-workout finding above means a given
   `(workoutId, exerciseId)` pair isn't guaranteed to have a stable, complete
   set of repetitions the first time it's seen — content could still be
-  accumulating under that same workout ID. Tracking at the individual
-  repetition-ID level (globally unique, immutable once it exists) is safe
-  regardless of how upstream workout/series grouping behaves.
+  accumulating under that same workout ID.
 - Per (athlete, workout, exercise) unit: before building the event, check
-  whether every repetition ID for that unit (concentric and eccentric — the
-  form now includes both) is already in the committed state file.
-  - All already seen → skip entirely, nothing changed.
-  - Any new → rebuild the **full** current row set (previously-imported reps
-    + new ones) and submit via `existingEventId` if we have one on file for
-    this unit, since `eventimport` update replaces rather than merges (see
-    Teamworks API notes above) — a partial resend would drop the
-    previously-imported rows.
+  whether it's changed since we last wrote it. All already seen → skip
+  entirely, nothing changed. Any new → rebuild the **full** current row set
+  (previously-imported reps + new ones) and submit via `existingEventId` if
+  we have one on file for this unit, since `eventimport` update replaces
+  rather than merges (see Teamworks API notes above) — a partial resend
+  would drop the previously-imported rows.
 - This also naturally handles the ordinary (non-anomalous) case of an
   athlete doing the same exercise twice in one day under two different
   workout records, without extra logic.
@@ -346,17 +352,75 @@ never assume a fixed set per `Type`.
   to be persisted in the state file per (athlete, workout, exercise) unit to
   support this update path.
 
+**As implemented (`vitruve_sync/dedup.py`):** the actual change-detection
+signal is **row count**, not a full repetition-ID set. The finalized AMS
+form has no per-repetition identifier column (only `Type`/`Set`/metrics), so
+there's nothing to compare individual repetition IDs against once the data
+is in Teamworks — "the exercise now has more table rows than last time we
+wrote it" is the practical signal actually available, not a hypothetical
+downgrade. State file: `state/dedup_state.json`, keyed by
+`f"{workoutId}:{exerciseId}"`, storing `{existingEventId, rowCount,
+teamworksUserId}`, committed back to the repo by the GitHub Actions workflow
+only when it actually changes (avoids a commit every 30 minutes on quiet
+nights). Known limitation: this is self-tracked, not reconciled against
+Teamworks directly — losing the file (or a failed commit) risks duplicate
+events on the next run. `/api/v1/eventsearch` or `/api/v1/synchronise`
+(event) could rebuild this from Teamworks directly as a future self-healing
+step, but their response shape for our custom form fields is undocumented
+and untested against a real call, so it wasn't built blind — flagged as a
+followup once we can verify against live data, not a silent gap.
+
 ## Credentials
 
 - Vitruve: `API_KEY` (already in repo secrets), `x-api-key` header.
-- Teamworks: Basic Auth username/password (new repo secrets, names TBD e.g.
-  `TEAMWORKS_USERNAME` / `TEAMWORKS_PASSWORD`), plus a fixed `X-APP-ID`
-  string.
+- Teamworks: `A360_USER` / `A360_PASSWORD` (repo secrets, Basic Auth), plus
+  fixed `X-APP-ID: usss.vitruve-integration.v1`.
 - Access-model ask for whoever provisions the Teamworks account: write access
   limited to the Vitruve VBT form, **and** read access to the full user
   roster via `usersynchronise` for athlete-matching — confirm this doesn't
   get inadvertently blocked by the same scoping that restricts form access,
   per the Coach-account caveat above.
+
+## Implementation (`vitruve_sync/`)
+
+- `config.py` — constants: Teamworks base URL
+  `https://usopc.smartabase.com/athlete360-usss`, form name `Vitruve VBT`,
+  AMS field name constants, `LOCAL_TIMEZONE = "America/Denver"` (assumed —
+  confirm against a real smoke test), `VITRUVE_DATE_RANGE = "last-7days"`.
+- `vitruve_client.py` / `teamworks_client.py` — stdlib `urllib` only, no
+  external dependencies. Both v1 Teamworks endpoints require
+  `?informat=json&format=json` on every call (in the OpenAPI spec, easy to
+  miss) — baked into `TeamworksClient._post`.
+- `matching.py` — full-name join per "Athlete matching" above.
+- `transform.py` — `KNOWN_METRIC_FIELDS` is the live 22-metric AMS column
+  whitelist; the 13 excluded metrics are commented out inline, ready to
+  uncomment once those AMS columns exist.
+- `dedup.py` — see "Dedup / idempotency" above.
+- `main.py` — orchestrates extract → match → transform → dedup → load,
+  logs only IDs/counts, never names/emails.
+- `.github/workflows/vitruve_sync.yml` — `cron: "*/30 * * * *"` +
+  `workflow_dispatch`. **Scheduled workflows only run on the repo's default
+  branch** — this won't fire until merged there. `workflow_dispatch` works
+  from any branch that has the file, so it's usable for a manual smoke test
+  before merging.
+- `tests/` — 17 unit tests against synthetic fixtures (no real athlete
+  data), covering matching, transform, and dedup in isolation. Verified
+  separately with a full `main.run()` smoke test using mocked
+  Vitruve/Teamworks clients (not committed as a test — no real API access
+  in the environment this was built in) confirming the end-to-end wiring:
+  match → build payload → write → skip-on-rerun → anomaly/unknown-metric
+  alerting all fired correctly against fixture data.
+
+**Deliberately not implemented in v1** (see "Status" above): the manual
+mapping-form fallback for unresolved athlete names, and self-healing dedup
+reconciliation against Teamworks' own event data.
+
+**Before turning the schedule on:** this has never been run against the
+real Vitruve/Teamworks APIs. Trigger one `workflow_dispatch` run by hand
+first and read the logged summary counts and any write failures before
+relying on the cron — per the field notes, a wrong assumption caught early
+is cheap; the same mistake repeated every 30 minutes into a live AMS
+instance is not.
 
 ## Observability
 
