@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+
+# Real pulled Vitruve data - never commit, even though vbt-workouts has no
+# names/emails (just UUIDs), it's still real athlete performance data.
+/samples/
