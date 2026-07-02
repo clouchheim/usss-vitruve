@@ -1,6 +1,11 @@
 """Entrypoint: pull Vitruve, match athletes, transform, dedup, load into
 Teamworks AMS. Run every ~30 min via .github/workflows/vitruve_sync.yml.
 
+Dedup has no local state: each run asks Teamworks itself (via eventsearch)
+which of this run's candidate units already have an event, and only writes
+the ones that don't - see teamworks_client.find_existing_unit_ids and
+CLAUDE.md "Dedup / idempotency".
+
 Never logs athlete names/emails - only Vitruve/Teamworks IDs and counts,
 per CLAUDE.md's observability section.
 """
@@ -8,9 +13,13 @@ per CLAUDE.md's observability section.
 import os
 import sys
 from collections import Counter
+from datetime import datetime, timedelta, timezone
 
-from vitruve_sync.config import STATE_PATH, VITRUVE_DATE_RANGE
-from vitruve_sync.dedup import load_state, needs_write, record, save_state
+from vitruve_sync.config import (
+    TEAMWORKS_SEARCH_LOOKAHEAD_DAYS,
+    TEAMWORKS_SEARCH_LOOKBACK_DAYS,
+    VITRUVE_DATE_RANGE,
+)
 from vitruve_sync.matching import AMBIGUOUS, UNMATCHED, build_name_index, match_athlete
 from vitruve_sync.teamworks_client import TeamworksClient, TeamworksError
 from vitruve_sync.transform import (
@@ -24,6 +33,13 @@ from vitruve_sync.vitruve_client import VitruveClient, VitruveError
 
 def log(message):
     print(message, flush=True)
+
+
+def _search_window():
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=TEAMWORKS_SEARCH_LOOKBACK_DAYS)
+    finish = now + timedelta(days=TEAMWORKS_SEARCH_LOOKAHEAD_DAYS)
+    return start.strftime("%d/%m/%Y"), finish.strftime("%d/%m/%Y")
 
 
 def run():
@@ -45,9 +61,8 @@ def run():
     log(f"Pulling Vitruve workouts (date={VITRUVE_DATE_RANGE})...")
     workouts = vitruve.get_workouts(VITRUVE_DATE_RANGE)
 
-    state = load_state(STATE_PATH)
-    unrecognized_metrics = set()
-
+    # Pass 1: resolve athlete matches, compute this run's candidate units.
+    candidates = []
     for workout, exercise in iter_exercise_units(workouts):
         counts["exercises_seen"] += 1
 
@@ -64,11 +79,36 @@ def run():
             counts["athlete_ambiguous_name"] += 1
             continue
 
-        unit_id = compute_unit_id(workout, exercise)
+        candidates.append(
+            {
+                "workout": workout,
+                "exercise": exercise,
+                "teamworks_user_id": teamworks_user_id,
+                "unit_id": compute_unit_id(workout, exercise),
+            }
+        )
+
+    # One standard call per run: ask Teamworks which of these units already
+    # have a "Vitruve VBT" event, rather than trusting a local state file.
+    start_date, finish_date = _search_window()
+    matched_user_ids = {c["teamworks_user_id"] for c in candidates}
+    candidate_unit_ids = {c["unit_id"] for c in candidates}
+    existing_unit_ids = teamworks.find_existing_unit_ids(
+        start_date, finish_date, matched_user_ids, candidate_unit_ids
+    )
+    log(f"  {len(existing_unit_ids)}/{len(candidate_unit_ids)} candidate units already in Teamworks")
+
+    # Pass 2: build and write only the units that don't already exist.
+    unrecognized_metrics = set()
+    for candidate in candidates:
+        unit_id = candidate["unit_id"]
+        if unit_id in existing_unit_ids:
+            counts["skipped_duplicate"] += 1
+            continue
 
         try:
             payload, row_count, unknown_metrics, spans_multiple_days = build_event_payload(
-                workout, exercise, teamworks_user_id
+                candidate["workout"], candidate["exercise"], candidate["teamworks_user_id"]
             )
         except UnschedulableExercise:
             counts["exercise_missing_dates"] += 1
@@ -77,15 +117,7 @@ def run():
         unrecognized_metrics |= unknown_metrics
         if spans_multiple_days:
             counts["multiday_anomaly"] += 1
-            log(f"  ANOMALY: exercise {exercise.get('id')} series span multiple calendar days")
-
-        should_write, existing_event_id = needs_write(state, unit_id, row_count)
-        if not should_write:
-            counts["skipped_duplicate"] += 1
-            continue
-
-        if existing_event_id:
-            payload["existingEventId"] = existing_event_id
+            log(f"  ANOMALY: exercise for unit {unit_id} - series span multiple calendar days")
 
         try:
             success, event_id, response = teamworks.import_event(payload)
@@ -99,10 +131,8 @@ def run():
             log(f"  WRITE FAILED (state={response.get('state')}) for unit {unit_id}: {response}")
             continue
 
-        record(state, unit_id, event_id or existing_event_id, row_count, teamworks_user_id)
         counts["written"] += 1
-
-    save_state(STATE_PATH, state)
+        log(f"  wrote unit {unit_id} -> event {event_id} ({row_count} rows)")
 
     if unrecognized_metrics:
         log(f"ALERT: unrecognized metric names encountered: {sorted(unrecognized_metrics)}")

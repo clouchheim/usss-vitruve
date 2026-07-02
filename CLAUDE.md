@@ -21,13 +21,12 @@ Still open/unimplemented:
 - Manual-mapping-form fallback (Approach B) for athletes the name match
   can't resolve — currently just logged as `athlete_unmatched` /
   `athlete_ambiguous_name` counts, not auto-resolved against a backup form.
-- Self-healing dedup reconciliation against Teamworks directly (via
-  `eventsearch`/`synchronise`) if the committed state file is ever lost —
-  deliberately not built blind against an undocumented response shape, see
-  "Dedup" below.
 - The 13 excluded metrics (1RM, Fatigue, Jump *) — add their AMS columns and
   uncomment the matching keys in `vitruve_sync/transform.py`'s
   `KNOWN_METRIC_FIELDS` once done.
+- No update path for a unit whose rep count grows after first import (see
+  "Dedup" below) — accepted trade-off of the eventsearch-based design, not
+  an oversight.
 
 Diagnostic script `scripts/pull_vitruve_last_week.py` (read-only, Vitruve
 side only) remains for capturing fresh samples if needed.
@@ -45,6 +44,8 @@ Source docs in repo root:
 - `vitruve_api_docs.pdf` — Vitruve Exports API
 - `teamworks_api_docs.docx` — Teamworks AMS v1 API (OpenAPI excerpts for
   `usersynchronise` and `eventimport`)
+- `teamworks_event_read_endpoints.md` — `synchronise` (event) and
+  `eventsearch` OpenAPI excerpts, pasted later once dedup design needed them
 - `AMS_EVENTIMPORT_NOTES.md` — field-tested notes from a prior AMS integration
   (`usss-mocap`) covering gotchas not in the official docs
 
@@ -70,10 +71,10 @@ Source docs in repo root:
 
 ## Teamworks AMS API (from `teamworks_api_docs.docx` + `AMS_EVENTIMPORT_NOTES.md`)
 
-Two v1 endpoints matter for this integration; both use **HTTP Basic Auth**
+Three v1 endpoints matter for this integration; all use **HTTP Basic Auth**
 (base64 `username:password` in the `Authorization` header — no session/token
 for v1) plus an optional `X-APP-ID` header to identify our integration to
-Teamworks support.
+Teamworks support, and all require `?informat=json&format=json` on the URL.
 
 **`POST /api/v1/usersynchronise`** — roster lookup, used for athlete matching
 and to resolve the `userId` needed on every `eventimport` call.
@@ -82,14 +83,23 @@ and to resolve the `userId` needed on every `eventimport` call.
 - Supports delta sync via `lastSynchronisationTimeOnServer` (pass `0` for a
   full pull, persist the value returned and pass it back next time to get
   only changed/new users) — this is the recommended pattern per Teamworks'
-  own docs, cheaper than a full pull every run.
-- **Caveat (from field notes, not the official docs):** the user-list is
-  wrapped under an implementation-specific key that isn't precisely
-  documented — detect it by shape (first list-of-dicts value in the
-  response) rather than hardcoding a key name. Field names on individual user
-  objects also vary by instance (`userId`/`user_id`/`id`,
-  `firstName`/`first_name`, etc.) — resolve with a small helper that tries
-  candidate keys, don't assume one.
+  own docs, cheaper than a full pull every run. **As implemented:** full
+  pull every run (`lastSynchronisationTimeOnServer: 0` always) — delta sync
+  needs a persisted, merged local roster cache (handling `mergedUsers`/
+  `idsOfDeletedUsers`) which is real complexity not worth taking on blind at
+  this org's roster size. Revisit only if the roster grows enough to matter.
+- **Confirmed against a real call** (previously "detect by shape,
+  undocumented" — now verified): the user list lives under a top-level
+  `"users"` key, with objects shaped like `{"userId": 13354, "firstName":
+  "...", "lastName": "...", "dob", "middleName", "emailAddress", "knownAs",
+  "organisationalId", "username", "phoneNumbers", "sex", "uuid"}`. Code uses
+  `"users"` directly now, falling back to the old shape-detection heuristic
+  (first list-of-dicts value in the response) only if that key is ever
+  absent — cheap insurance against a future API change, not the primary
+  path anymore. Note **`emailAddress` does exist on the Teamworks side** —
+  doesn't change the matching decision below since Vitruve's `/users` has
+  no email field at all, so there's still nothing to join on, but worth
+  knowing it's there for other purposes.
 - **Caveat:** if our API account is a restricted Coach-role account (likely,
   given the "only touch the Vitruve VBT form" access model), `usersynchronise`
   won't return users removed from a group the account can see. This needs to
@@ -139,25 +149,43 @@ custom label).
   data that should have produced ~105). **Batch into the fewest events that
   make semantic sense.**
 
+**`POST /api/v1/eventsearch`** — read path used for dedup (see "Dedup /
+idempotency" below), not `synchronise`: the docs explicitly recommend
+`synchronise` when you're maintaining a local cache, and `eventsearch` when
+you need server-side date filtering without one — the latter is exactly
+this design once the local state file was dropped.
+- Request: `formNames` (array, exact match), `startDate`/`finishDate`
+  (`dd/mm/yyyy`), `userIds` (array of ints), pagination via top-level
+  `{"paginate": true, "cursor": "..."}` (omit `cursor` on the first page).
+- Response: `{"events": [...]}` plus a next-page cursor — **the source docs
+  disagree with themselves on this field's name**: the prose says
+  `next_cursor`, the OpenAPI schema in the same doc names it `cursor`. See
+  `teamworks_event_read_endpoints.md` for the exact excerpt. Code accepts
+  either (`response.get("next_cursor") or response.get("cursor")`) rather
+  than betting on one.
+- **Per-event shape beyond the numeric `id` field is undocumented** — the
+  OpenAPI excerpt doesn't say how a custom field like our `Vitruve ID`
+  appears in a returned event. Extraction is defensive: try the field name
+  as a direct key, then fall back to a recursive scan of the whole event
+  object for the exact string value. This is the single biggest unverified
+  assumption in the whole integration — see the Dedup section for how to
+  check it on the first live run.
+
 ## Proposed architecture
 
 ```
 [Scheduled trigger] → [Extract: Vitruve] → [Match: athlete resolution]
-  → [Transform: flatten] → [Dedup filter] → [Load: Teamworks AMS] → [State commit]
+  → [Transform: flatten] → [Dedup check against Teamworks] → [Load: Teamworks AMS]
 ```
 
 - **Runner**: GitHub Actions on a cron schedule. `API_KEY` (Vitruve) already
-  lives in repo secrets; Teamworks Basic Auth credentials will go there too
-  (e.g. `TEAMWORKS_USERNAME` / `TEAMWORKS_PASSWORD`), scoped to read/write
-  only the Vitruve VBT form plus roster-read (see caveat above).
-- **State persistence**: no external DB — plan is to commit a small JSON
-  state file back to the repo after each successful run, keyed by (athlete,
-  workout, exercise) unit and storing all imported repetition IDs (both
-  concentric and eccentric, per the finalized form) plus the
-  `existingEventId` Teamworks returned, to support the skip-if-unchanged /
-  resend-full-state-if-new-reps-appear logic — see Dedup section (updated
-  after the first real sample pull surfaced a case where a workout's
-  contents can't be assumed complete/final at first sight).
+  lives in repo secrets; Teamworks Basic Auth credentials too (`A360_USER` /
+  `A360_PASSWORD`), scoped to read/write only the Vitruve VBT form plus
+  roster-read (see caveat above).
+- **State persistence**: none — no local file, no external DB. Dedup is
+  answered fresh every run by querying Teamworks' own `eventsearch`
+  endpoint for what's already there. See "Dedup / idempotency" below for
+  the full reasoning and the one real risk this carries.
 
 ## Athlete matching — settled: full name is the ground-truth join key
 
@@ -333,42 +361,56 @@ never assume a fixed set per `Type`.
 
 ## Dedup / idempotency
 
-- **Updated: track dedup state at the repetition level, not (workoutId,
-  exerciseId).** The multi-day-workout finding above means a given
-  `(workoutId, exerciseId)` pair isn't guaranteed to have a stable, complete
-  set of repetitions the first time it's seen — content could still be
-  accumulating under that same workout ID.
-- Per (athlete, workout, exercise) unit: before building the event, check
-  whether it's changed since we last wrote it. All already seen → skip
-  entirely, nothing changed. Any new → rebuild the **full** current row set
-  (previously-imported reps + new ones) and submit via `existingEventId` if
-  we have one on file for this unit, since `eventimport` update replaces
-  rather than merges (see Teamworks API notes above) — a partial resend
-  would drop the previously-imported rows.
-- This also naturally handles the ordinary (non-anomalous) case of an
-  athlete doing the same exercise twice in one day under two different
-  workout records, without extra logic.
-- `existingEventId` returned from each successful `eventimport` call needs
-  to be persisted in the state file per (athlete, workout, exercise) unit to
-  support this update path.
+**Superseded design decision:** v1 originally planned a git-committed JSON
+state file (`state/dedup_state.json`) as the dedup source of truth, with
+row-count comparison to detect late-arriving reps and an update-via-
+`existingEventId` path. That's been replaced with a simpler, self-healing
+design once Teamworks' `/api/v1/eventsearch` docs were in hand — see below.
+The old row-count/state-file reasoning is kept here only as history, not as
+the current design.
 
-**As implemented (`vitruve_sync/dedup.py`):** the actual change-detection
-signal is **row count**, not a full repetition-ID set. The finalized AMS
-form has no per-repetition identifier column (only `Type`/`Set`/metrics), so
-there's nothing to compare individual repetition IDs against once the data
-is in Teamworks — "the exercise now has more table rows than last time we
-wrote it" is the practical signal actually available, not a hypothetical
-downgrade. State file: `state/dedup_state.json`, keyed by
-`f"{workoutId}:{exerciseId}"`, storing `{existingEventId, rowCount,
-teamworksUserId}`, committed back to the repo by the GitHub Actions workflow
-only when it actually changes (avoids a commit every 30 minutes on quiet
-nights). Known limitation: this is self-tracked, not reconciled against
-Teamworks directly — losing the file (or a failed commit) risks duplicate
-events on the next run. `/api/v1/eventsearch` or `/api/v1/synchronise`
-(event) could rebuild this from Teamworks directly as a future self-healing
-step, but their response shape for our custom form fields is undocumented
-and untested against a real call, so it wasn't built blind — flagged as a
-followup once we can verify against live data, not a silent gap.
+**As implemented (`vitruve_sync/teamworks_client.py::find_existing_unit_ids`,
+called once per run from `main.py`):** no local state at all. Each run:
+
+1. Resolves athlete matches and computes this run's candidate unit IDs
+   (`f"{workoutId}:{exerciseId}"`) as before.
+2. Makes **one** `POST /api/v1/eventsearch` call — `formNames: ["Vitruve
+   VBT"]`, `userIds` scoped to this run's matched athletes, `startDate`/
+   `finishDate` covering an 8-day-back / 1-day-ahead window (wider than
+   Vitruve's own `last-7days` pull, as a buffer against timezone edge
+   cases) — and collects every returned event's `Vitruve ID` value.
+3. Any candidate unit already found there is **skipped**; everything else
+   is created fresh via `eventimport` (never with `existingEventId` — this
+   design only ever creates, it never updates an existing event).
+
+Teamworks itself is the single source of truth, queried fresh every run —
+no risk of a lost/corrupted local file causing duplicate events, and no
+separate git-commit step needed in the GitHub Actions workflow.
+
+**Trade-off accepted along with this:** because it's create-only, an
+exercise that gains more reps *after* first import (the multi-day-workout
+anomaly case above) will never be picked up on a later run — its unit ID
+is already "found," so it's skipped forever. Given that case is already
+treated as a data-quality anomaly to log/alert on rather than solve (see
+finding 6), this was judged an acceptable simplification, but it is a real
+behavior change from "resend full state on change" to "first import wins."
+
+**Unverified risk, flagged for the first live smoke test:** `eventsearch`'s
+OpenAPI excerpt only documents each returned event's numeric `id` field —
+it does not document how a custom event-level field like `Vitruve ID`
+appears in the response (a flat key? nested under a rows/answers
+structure?). `_find_candidate_unit_id` handles this defensively: try
+`event["Vitruve ID"]` directly, then fall back to a recursive scan of the
+whole event object for the exact string value (robust to an unknown shape,
+since we already know the finite set of values we're looking for rather
+than needing to parse an unknown one). **This must be confirmed on the
+first live run** — if `eventsearch` doesn't actually surface the field in
+a way this can find, every run would see "nothing exists yet" and create a
+duplicate event every 30 minutes, which is a worse failure mode than the
+state-file approach's "only breaks if the file is lost." Check this
+specifically before turning the cron on: run once, then run again shortly
+after, and confirm the second run's log shows the units from the first run
+as already-existing, not re-written.
 
 ## Credentials
 
@@ -386,41 +428,50 @@ followup once we can verify against live data, not a silent gap.
 - `config.py` — constants: Teamworks base URL
   `https://usopc.smartabase.com/athlete360-usss`, form name `Vitruve VBT`,
   AMS field name constants, `LOCAL_TIMEZONE = "America/Denver"` (assumed —
-  confirm against a real smoke test), `VITRUVE_DATE_RANGE = "last-7days"`.
+  confirm against a real smoke test), `VITRUVE_DATE_RANGE = "last-7days"`,
+  `TEAMWORKS_SEARCH_LOOKBACK_DAYS` / `_LOOKAHEAD_DAYS` for the eventsearch
+  dedup window.
 - `vitruve_client.py` / `teamworks_client.py` — stdlib `urllib` only, no
-  external dependencies. Both v1 Teamworks endpoints require
+  external dependencies. All v1 Teamworks endpoints require
   `?informat=json&format=json` on every call (in the OpenAPI spec, easy to
-  miss) — baked into `TeamworksClient._post`.
+  miss) — baked into `TeamworksClient._post`. `teamworks_client.py` also
+  holds `find_existing_unit_ids` (the eventsearch-based dedup check) and its
+  defensive extraction helpers — see "Dedup / idempotency" above.
 - `matching.py` — full-name join per "Athlete matching" above.
 - `transform.py` — `KNOWN_METRIC_FIELDS` is the live 22-metric AMS column
   whitelist; the 13 excluded metrics are commented out inline, ready to
-  uncomment once those AMS columns exist.
-- `dedup.py` — see "Dedup / idempotency" above.
-- `main.py` — orchestrates extract → match → transform → dedup → load,
-  logs only IDs/counts, never names/emails.
+  uncomment once those AMS columns exist. `build_event_payload` always
+  creates (never sends `existingEventId`) — dedup happens entirely before
+  this is called, via `main.py`'s two-pass flow.
+- `main.py` — pass 1 resolves athlete matches and computes this run's
+  candidate unit IDs; one `find_existing_unit_ids` call checks all of them
+  against Teamworks at once; pass 2 builds and writes only the units not
+  already there. Logs only IDs/counts, never names/emails.
 - `.github/workflows/vitruve_sync.yml` — `cron: "*/30 * * * *"` +
-  `workflow_dispatch`. **Scheduled workflows only run on the repo's default
-  branch** — this won't fire until merged there. `workflow_dispatch` works
-  from any branch that has the file, so it's usable for a manual smoke test
-  before merging.
+  `workflow_dispatch`. No state to commit back to the repo anymore, so no
+  git-write permissions or commit step needed. **Scheduled workflows only
+  run on the repo's default branch** — this won't fire until merged there.
+  `workflow_dispatch` works from any branch that has the file, so it's
+  usable for a manual smoke test before merging.
 - `tests/` — 17 unit tests against synthetic fixtures (no real athlete
-  data), covering matching, transform, and dedup in isolation. Verified
-  separately with a full `main.run()` smoke test using mocked
-  Vitruve/Teamworks clients (not committed as a test — no real API access
-  in the environment this was built in) confirming the end-to-end wiring:
-  match → build payload → write → skip-on-rerun → anomaly/unknown-metric
-  alerting all fired correctly against fixture data.
+  data), covering matching, transform, and the eventsearch dedup extraction
+  logic in isolation. Verified separately with a full `main.run()` smoke
+  test using mocked Vitruve/Teamworks clients (not committed as a test — no
+  real API access in the environment this was built in) confirming the
+  end-to-end wiring: match → build payload → write → skip-on-rerun →
+  anomaly/unknown-metric alerting all fired correctly against fixture data.
 
 **Deliberately not implemented in v1** (see "Status" above): the manual
-mapping-form fallback for unresolved athlete names, and self-healing dedup
-reconciliation against Teamworks' own event data.
+mapping-form fallback for unresolved athlete names.
 
 **Before turning the schedule on:** this has never been run against the
 real Vitruve/Teamworks APIs. Trigger one `workflow_dispatch` run by hand
-first and read the logged summary counts and any write failures before
-relying on the cron — per the field notes, a wrong assumption caught early
-is cheap; the same mistake repeated every 30 minutes into a live AMS
-instance is not.
+first, then run it again shortly after and confirm the second run's log
+shows the first run's units as already-existing (not re-written) — this is
+the eventsearch shape assumption from the Dedup section, and it's the
+single biggest thing that could be wrong. Per the field notes, a wrong
+assumption caught early is cheap; the same mistake repeated every 30
+minutes into a live AMS instance is not.
 
 ## Observability
 

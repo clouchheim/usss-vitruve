@@ -47,6 +47,20 @@ KNOWN_METRIC_FIELDS = frozenset(
         "Mean Propulsive Velocity (m/s)",
         "Repetition Duration (ms)",
         "Peak Power / Body Weight (w/kg)",
+        # Uncomment once these 13 columns exist on the AMS form:
+        # "1RM (kg)",
+        # "1RM / Body Weight (%)",
+        # "Fatigue (PV) (%)",
+        # "Fatigue [MPV] (%)",
+        # "Fatigue [MV] (%)",
+        # "Jump Contact Time (ms)",
+        # "Jump Contraction Time (ms)",
+        # "Jump Flight Time (ms)",
+        # "Jump Height (m)",
+        # "Jump Modified RSI (m/s)",
+        # "Jump Net Impulse (N)",
+        # "Jump Positive Impulse (N)",
+        # "Jump RSI (m/s)",
     }
 )
 
@@ -104,11 +118,13 @@ def format_time(local_dt):
     return local_dt.strftime("%I:%M %p").lstrip("0") or "12:00 AM"
 
 
-def build_event_payload(workout, exercise, teamworks_user_id, existing_event_id=None):
+def build_event_payload(workout, exercise, teamworks_user_id):
     """Returns (payload, row_count, unknown_metric_keys, spans_multiple_days).
 
-    row_count excludes row 0 (event-level fields) - it's the dedup signal
-    compared against what's already on file for this unit.
+    Always a create (never sends existingEventId) - dedup is a Teamworks
+    eventsearch existence check done by the caller before this is called at
+    all, see teamworks_client.find_existing_unit_ids and CLAUDE.md.
+    row_count excludes row 0 (event-level fields); returned for logging only.
     """
     session_dt, spans_multiple_days = derive_session_datetime(exercise)
     date_str = session_dt.strftime("%d/%m/%Y")
@@ -152,8 +168,5 @@ def build_event_payload(workout, exercise, teamworks_user_id, existing_event_id=
         "userId": {"userId": teamworks_user_id},
         "rows": rows,
     }
-    if existing_event_id:
-        payload["existingEventId"] = existing_event_id
-
     row_count = len(rows) - 1
     return payload, row_count, unknown_metrics, spans_multiple_days

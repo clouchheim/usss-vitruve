@@ -80,10 +80,3 @@ def test_build_event_payload_shape():
     assert {"key": "Set", "value": "2"} in row3
 
     assert unknown_metrics == {"Not A Real Metric (xyz)"}
-
-
-def test_build_event_payload_includes_existing_event_id_when_given():
-    workout = workout_with(clean_exercise())
-    exercise = workout["exercises"][0]
-    payload, *_ = build_event_payload(workout, exercise, 4001, existing_event_id=778899)
-    assert payload["existingEventId"] == 778899
