@@ -1,4 +1,5 @@
 from vitruve_sync.transform import (
+    KNOWN_METRIC_FIELDS,
     UnschedulableExercise,
     assign_set_numbers,
     build_event_payload,
@@ -6,7 +7,7 @@ from vitruve_sync.transform import (
     derive_session_datetime,
 )
 
-from tests.fixtures import clean_exercise, multiday_exercise, workout_with
+from tests.fixtures import clean_exercise, make_metric, make_rep, make_series, multiday_exercise, workout_with
 
 
 def test_compute_unit_id_combines_workout_and_exercise():
@@ -80,3 +81,41 @@ def test_build_event_payload_shape():
     assert {"key": "Set", "value": "2"} in row3
 
     assert unknown_metrics == {"Not A Real Metric (xyz)"}
+
+
+def test_known_metric_fields_includes_1rm_and_fatigue_now_that_columns_exist():
+    # Confirmed added to the real AMS form - see conversation history.
+    assert "1RM (kg)" in KNOWN_METRIC_FIELDS
+    assert "1RM / Body Weight (%)" in KNOWN_METRIC_FIELDS
+    assert "Fatigue (PV) (%)" in KNOWN_METRIC_FIELDS
+    assert "Fatigue [MPV] (%)" in KNOWN_METRIC_FIELDS
+    assert "Fatigue [MV] (%)" in KNOWN_METRIC_FIELDS
+    # Jump metrics remain excluded until those columns exist too.
+    assert "Jump Height (m)" not in KNOWN_METRIC_FIELDS
+
+
+def test_build_event_payload_includes_1rm_and_fatigue_metrics():
+    rep = make_rep(
+        "rep-1",
+        "concentric",
+        [
+            make_metric("1RM", 0.16, "kg"),
+            make_metric("1RM / Body Weight", 0.2105263157894737, "%"),
+            make_metric("Fatigue [MPV]", 40, "%"),
+            make_metric("Fatigue [MV]", 33.09, "%"),
+            make_metric("Fatigue (PV)", 41.07, "%"),
+        ],
+    )
+    series = make_series("series-1", "2026-01-05T17:01:30.000Z", [rep])
+    exercise = {"id": "exercise-1", "name": "Back Squat", "series": [series]}
+    workout = workout_with(exercise)
+
+    payload, _, unknown_metrics, _ = build_event_payload(workout, exercise, teamworks_user_id=4001)
+
+    assert unknown_metrics == set()
+    row1 = payload["rows"][1]["pairs"]
+    assert {"key": "1RM (kg)", "value": "0.16"} in row1
+    assert {"key": "1RM / Body Weight (%)", "value": "0.21"} in row1
+    assert {"key": "Fatigue [MPV] (%)", "value": "40"} in row1
+    assert {"key": "Fatigue [MV] (%)", "value": "33.09"} in row1
+    assert {"key": "Fatigue (PV) (%)", "value": "41.07"} in row1

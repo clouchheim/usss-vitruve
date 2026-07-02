@@ -18,11 +18,11 @@ from vitruve_sync.config import (
 )
 
 # Exact AMS form field keys, f"{metric} ({unit})" using Vitruve's own
-# metric/unit strings. Confirmed 22-metric vocabulary shared by concentric
-# and eccentric reps. The 13 concentric-only/jump-only metrics (1RM,
-# Fatigue *, Jump *) are intentionally excluded until those columns exist
-# on the form - see CLAUDE.md for the full excluded list. Never emit a pair
-# for a metric that isn't in this set; log it as unrecognized instead.
+# metric/unit strings. 1RM and Fatigue * columns confirmed added to the real
+# form and included below. The remaining 8 jump-only metrics are still
+# intentionally excluded until those columns exist - see CLAUDE.md for the
+# full list. Never emit a pair for a metric that isn't in this set; log it
+# as unrecognized instead.
 KNOWN_METRIC_FIELDS = frozenset(
     {
         "Peak Velocity (m/s)",
@@ -47,12 +47,12 @@ KNOWN_METRIC_FIELDS = frozenset(
         "Mean Propulsive Velocity (m/s)",
         "Repetition Duration (ms)",
         "Peak Power / Body Weight (w/kg)",
-        # Uncomment once these 13 columns exist on the AMS form:
-        # "1RM (kg)",
-        # "1RM / Body Weight (%)",
-        # "Fatigue (PV) (%)",
-        # "Fatigue [MPV] (%)",
-        # "Fatigue [MV] (%)",
+        "1RM (kg)",
+        "1RM / Body Weight (%)",
+        "Fatigue (PV) (%)",
+        "Fatigue [MPV] (%)",
+        "Fatigue [MV] (%)",
+        # Uncomment once these 8 jump columns exist on the AMS form:
         # "Jump Contact Time (ms)",
         # "Jump Contraction Time (ms)",
         # "Jump Flight Time (ms)",

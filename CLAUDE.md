@@ -6,26 +6,38 @@ dedicated Vitruve VBT form.
 
 ## Status
 
-**v1 implemented** (`vitruve_sync/` package + `.github/workflows/vitruve_sync.yml`,
-scheduled every 30 minutes). Built against the real "Vitruve VBT" form once
-it existed — see "Learnings from first real sample" and "Transform" below
-for how the design got there. Verified so far: 18 unit tests
-(`tests/`, synthetic fixtures only, no real athlete data) plus one full
-`main.run()` smoke test with mocked Vitruve/Teamworks clients confirming the
-whole pipeline — match, transform, write, dedup-skip-on-rerun, multi-day
-anomaly flagging, unrecognized-metric alerting. **The dedup read path's
-shape is now confirmed against a real request/response pair** (see "Dedup /
-idempotency" below) — the write path (`eventimport`) and the rest of the
-pipeline are still **not yet verified against the real live APIs**. See
-"Before turning the schedule on" below.
+**v1 implemented and live** (`vitruve_sync/` package +
+`.github/workflows/vitruve_sync.yml`, merged to `main`, scheduled every 30
+minutes). Built against the real "Vitruve VBT" form once it existed — see
+"Learnings from first real sample" and "Transform" below for how the
+design got there. Verified so far: 20 unit tests (`tests/`, synthetic
+fixtures only, no real athlete data) plus one full `main.run()` smoke test
+with mocked Vitruve/Teamworks clients confirming the whole pipeline —
+match, transform, write, dedup-skip-on-rerun, multi-day anomaly flagging,
+unrecognized-metric alerting. **Confirmed against real live runs**: both a
+manual `workflow_dispatch` and the cron schedule itself have run
+successfully end to end (real match → transform → `eventimport` write →
+`synchronise` dedup-skip on rerun), matching real athletes and writing
+real events. The first real run also surfaced 5 real metric values
+(`1RM`, `1RM / Body Weight`, and the three `Fatigue *` metrics) that were
+being correctly excluded/alerted-on rather than silently dropped — those
+columns have since been added to the form and to `KNOWN_METRIC_FIELDS`
+(see "Transform" below).
 
 Still open/unimplemented:
 - Manual-mapping-form fallback (Approach B) for athletes the name match
   can't resolve — currently just logged as `athlete_unmatched` /
   `athlete_ambiguous_name` counts, not auto-resolved against a backup form.
-- The 13 excluded metrics (1RM, Fatigue, Jump *) — add their AMS columns and
-  uncomment the matching keys in `vitruve_sync/transform.py`'s
-  `KNOWN_METRIC_FIELDS` once done.
+- The 8 excluded jump-only metrics — add their AMS columns and uncomment
+  the matching keys in `vitruve_sync/transform.py`'s `KNOWN_METRIC_FIELDS`
+  once done.
+- `vitruve_user_not_found` cases (Vitruve `userId` present on a workout but
+  absent from the `/users` roster pull) are occurring on real runs —
+  logged with the Vitruve `userId` and unit id per occurrence now (see
+  Observability), but the root cause (stale/deleted Vitruve account?
+  pre-migration ID needing `/legacy-ids`? `/users` pagination gap, since
+  `get_users()` doesn't paginate the way `get_workouts()` does?) is not
+  yet diagnosed.
 - No update path for a unit whose rep count grows after first import (see
   "Dedup" below) — accepted trade-off of the synchronise-based dedup
   design, not an oversight.
@@ -318,17 +330,18 @@ The form now exists in Teamworks. Actual field list:
   the exercise's series `completedAt` per finding 6 above, not workout-level
   timestamps.
 - **Table fields:** `Type` (concentric/eccentric), `Set` (see below), plus
-  22 metric columns, each named exactly `f"{metric} ({unit})"` using
-  Vitruve's own metric/unit strings — e.g. `Mean Propulsive Velocity (m/s)`,
-  `Mean Power [MPV] (W)`. This is the full 22-metric vocabulary shared by
-  both concentric and eccentric reps (confirmed against the 27/22 lists
-  above) — **currently excludes 13 concentric-only/jump-only metrics**:
+  metric columns, each named exactly `f"{metric} ({unit})"` using Vitruve's
+  own metric/unit strings — e.g. `Mean Propulsive Velocity (m/s)`, `Mean
+  Power [MPV] (W)`. Originally 22 columns, confirmed shared by both
+  concentric and eccentric reps (per the 27/22 lists above); a real live
+  run then surfaced 5 more real values on concentric reps for `1RM`, `1RM /
+  Body Weight`, and the three `Fatigue *` metrics that were silently
+  dropped (logged as `unrecognized metric names`, per the "no harm in extra
+  fields, harm in missing ones" principle) — those 5 columns have now been
+  **added to the real form and to `KNOWN_METRIC_FIELDS`**, confirmed
+  working (see `vitruve_sync/transform.py`). **Still excludes 8
+  jump-specific metrics**, pending their own form columns:
   ```
-  1RM (kg)
-  1RM / Body Weight (%)
-  Fatigue (PV) (%)
-  Fatigue [MPV] (%)
-  Fatigue [MV] (%)
   Jump Contact Time (ms)
   Jump Contraction Time (ms)
   Jump Flight Time (ms)
@@ -338,16 +351,10 @@ The form now exists in Teamworks. Actual field list:
   Jump Positive Impulse (N)
   Jump RSI (m/s)
   ```
-  These aren't hypothetical gaps — the sampled squat data already had real
-  `1RM`/`1RM / Body Weight` values on some concentric reps that would
-  silently vanish with no error, since a missing column and a blank cell
-  look identical from the API's perspective. Given the stated design
-  principle ("no harm in extra fields, harm in missing ones"), added to the
-  form. Note the 8 `Jump *` metrics are sourced from the CSV header list,
-  not yet observed in a real API response (this org's sampled sessions had
-  no jump-mat/force-plate exercise), so their exact metric-name strings are
-  unconfirmed against the live API — worth a quick sanity check against a
-  real jump-mat session once one exists.
+  These are sourced from the CSV header list, not yet observed in a real
+  API response (no jump-mat/force-plate exercise sampled yet), so their
+  exact metric-name strings are unconfirmed against the live API — worth a
+  quick sanity check against a real jump-mat session once one exists.
 
 **Finalized shape: one `eventimport` call per exercise entry, one table row
 per repetition (concentric AND eccentric, not concentric-only as originally
@@ -481,41 +488,39 @@ already-existing, not re-created.
   confirmed shape) and its extraction helpers — see "Dedup / idempotency"
   above.
 - `matching.py` — full-name join per "Athlete matching" above.
-- `transform.py` — `KNOWN_METRIC_FIELDS` is the live 22-metric AMS column
-  whitelist; the 13 excluded metrics are commented out inline, ready to
-  uncomment once those AMS columns exist. `build_event_payload` always
-  creates (never sends `existingEventId`) — dedup happens entirely before
-  this is called, via `main.py`'s two-pass flow.
+- `transform.py` — `KNOWN_METRIC_FIELDS` is the live AMS column whitelist:
+  the original 22 metrics plus `1RM`, `1RM / Body Weight`, and the three
+  `Fatigue *` metrics (confirmed added to the real form after a live run
+  surfaced real values for them). The remaining 8 jump-only metrics are
+  commented out inline, ready to uncomment once those AMS columns exist.
+  `build_event_payload` always creates (never sends `existingEventId`) —
+  dedup happens entirely before this is called, via `main.py`'s two-pass
+  flow.
 - `main.py` — pass 1 resolves athlete matches and computes this run's
   candidate unit IDs; one `find_existing_unit_ids` call checks all of them
   against Teamworks at once; pass 2 builds and writes only the units not
-  already there. Logs only IDs/counts, never names/emails.
+  already there. Logs only IDs/counts, never names/emails —
+  `vitruve_user_not_found` cases log the Vitruve `userId` and unit id.
 - `.github/workflows/vitruve_sync.yml` — `cron: "*/30 * * * *"` +
   `workflow_dispatch`. No state to commit back to the repo anymore, so no
-  git-write permissions or commit step needed. **Scheduled workflows only
-  run on the repo's default branch** — this won't fire until merged there.
-  `workflow_dispatch` works from any branch that has the file, so it's
-  usable for a manual smoke test before merging.
-- `tests/` — 18 unit tests against synthetic fixtures (no real athlete
+  git-write permissions or commit step needed. Merged to `main`, so both
+  the cron schedule and manual dispatch are live.
+- `tests/` — 20 unit tests against synthetic fixtures (no real athlete
   data), covering matching, transform, and the synchronise dedup extraction
   logic in isolation. Verified separately with a full `main.run()` smoke
-  test using mocked Vitruve/Teamworks clients (not committed as a test — no
-  real API access in the environment this was built in) confirming the
-  end-to-end wiring: match → build payload → write → skip-on-rerun →
-  anomaly/unknown-metric alerting all fired correctly against fixture data.
+  test using mocked Vitruve/Teamworks clients confirming the end-to-end
+  wiring: match → build payload → write → skip-on-rerun →
+  anomaly/unknown-metric alerting — and, since then, with real live runs
+  (see "Status" above).
 
 **Deliberately not implemented in v1** (see "Status" above): the manual
 mapping-form fallback for unresolved athlete names.
 
-**Before turning the schedule on:** the dedup read path's shape is now
-confirmed (see "Dedup / idempotency"), but the pipeline as a whole —
-including the `eventimport` write path — has never been run against the
-real Vitruve/Teamworks APIs end to end. Trigger one `workflow_dispatch` run
-by hand first, then run it again shortly after and confirm the second
-run's log shows the first run's units as already-existing (not
-re-written). Per the field notes, a wrong assumption caught early is
-cheap; the same mistake repeated every 30 minutes into a live AMS instance
-is not.
+**Confirmed end to end via real live runs** (both `workflow_dispatch` and
+the cron schedule): match → `eventimport` write → `synchronise` dedup-skip
+on rerun all fire correctly against real Vitruve/Teamworks data. Real
+findings from those runs are folded in above (the 5 additional metric
+columns; the still-open `vitruve_user_not_found` investigation).
 
 ## Observability
 
