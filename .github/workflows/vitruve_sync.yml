@@ -11,9 +11,6 @@ concurrency:
   group: vitruve-teamworks-sync
   cancel-in-progress: false
 
-permissions:
-  contents: write
-
 jobs:
   sync:
     runs-on: ubuntu-latest
@@ -30,15 +27,3 @@ jobs:
           A360_USER: ${{ secrets.A360_USER }}
           A360_PASSWORD: ${{ secrets.A360_PASSWORD }}
         run: python -m vitruve_sync.main
-
-      - name: Commit updated dedup state
-        run: |
-          if git diff --quiet -- state/dedup_state.json; then
-            echo "No state changes to commit"
-          else
-            git config user.name "vitruve-sync-bot"
-            git config user.email "actions@github.com"
-            git add state/dedup_state.json
-            git commit -m "Update Vitruve sync dedup state [skip ci]"
-            git push
-          fi
