@@ -1,6 +1,7 @@
 # USSS Vitruve x Teamworks AMS Integration
 
-Integration to connect Vitruve VBT Technology and USSS Teamworks AMS.  
+Integration to connect Vitruve VBT Technology and USSS Teamworks AMS. 
+Vitruve Data can be found at vitruve.fit
 
 ## Requires
 - API_KEY = api key from vitruve.fit Professional Subscription
