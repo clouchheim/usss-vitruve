@@ -521,7 +521,12 @@ is not.
 
 - Log per-run summary counts (pulled / matched / unmatched / written /
   skipped-duplicate / Teamworks-write-failed) — never log athlete
-  names/emails, only IDs and counts.
+  names/emails, only IDs and counts. This isn't just an internal
+  convention: the repo is public, so anything printed here lands in a
+  publicly-readable GitHub Actions log. `vitruve_user_not_found` cases log
+  the Vitruve `userId` (UUID) and unit id per occurrence (see `main.py`) so
+  a recurring miss can be told apart from a one-off, without ever printing
+  a name.
 - Treat every `eventimport` response's `state` field as the real success
   signal, not the HTTP status (200 is returned even on failure).
 - Alert on unmatched-athlete rate, unrecognized metric names, Teamworks
