@@ -9,13 +9,15 @@ dedicated Vitruve VBT form.
 **v1 implemented** (`vitruve_sync/` package + `.github/workflows/vitruve_sync.yml`,
 scheduled every 30 minutes). Built against the real "Vitruve VBT" form once
 it existed — see "Learnings from first real sample" and "Transform" below
-for how the design got there. Verified so far: 17 unit tests
+for how the design got there. Verified so far: 18 unit tests
 (`tests/`, synthetic fixtures only, no real athlete data) plus one full
 `main.run()` smoke test with mocked Vitruve/Teamworks clients confirming the
 whole pipeline — match, transform, write, dedup-skip-on-rerun, multi-day
-anomaly flagging, unrecognized-metric alerting. **Not yet verified against
-the real live APIs** — no credentials in the environment this was built in.
-See "Before turning the schedule on" below.
+anomaly flagging, unrecognized-metric alerting. **The dedup read path's
+shape is now confirmed against a real request/response pair** (see "Dedup /
+idempotency" below) — the write path (`eventimport`) and the rest of the
+pipeline are still **not yet verified against the real live APIs**. See
+"Before turning the schedule on" below.
 
 Still open/unimplemented:
 - Manual-mapping-form fallback (Approach B) for athletes the name match
@@ -25,22 +27,21 @@ Still open/unimplemented:
   uncomment the matching keys in `vitruve_sync/transform.py`'s
   `KNOWN_METRIC_FIELDS` once done.
 - No update path for a unit whose rep count grows after first import (see
-  "Dedup" below) — accepted trade-off of the eventsearch-based design, not
-  an oversight.
+  "Dedup" below) — accepted trade-off of the synchronise-based dedup
+  design, not an oversight.
 
 Diagnostic script `scripts/pull_vitruve_last_week.py` (read-only, Vitruve
 side only) remains for capturing fresh samples if needed.
 
 Diagnostic script `scripts/pull_teamworks_events.py` (read-only, Teamworks
-side only — calls `eventsearch` via the real `TeamworksClient`, never
-`eventimport`) exists specifically to verify the `eventsearch` shape
-assumption called out throughout this doc: run the real sync once via
-`workflow_dispatch`, then run this script with the resulting unit ids
-(`workoutId:exerciseId`, from the sync's own log lines) passed as
-`CANDIDATE_UNIT_IDS` to confirm `find_existing_unit_ids`'s extraction logic
-actually locates them in a live response, and inspect the saved raw JSON
-(`samples/teamworks-events-*.json`, gitignored) to see exactly where the
-`Vitruve ID` field lands in the real payload shape.
+side only — calls `synchronise` via the real `TeamworksClient`, never
+`eventimport`) exists to pull real events back for inspection: run the real
+sync once via `workflow_dispatch`, then run this script with the resulting
+Teamworks userId(s) and unit ids (`workoutId:exerciseId`, from the sync's
+own log lines) passed as `USER_IDS`/`CANDIDATE_UNIT_IDS` to confirm
+`find_existing_unit_ids`'s extraction logic actually locates them in a live
+response, and inspect the saved raw JSON (`samples/teamworks-events-*.json`,
+gitignored) to double-check the payload shape by eye.
 
 **Note on sample data realism:** the CSV/JSON sample pulled so far has
 implausible magnitudes for force/power/weight fields (e.g. "Mean Force"
@@ -56,7 +57,9 @@ Source docs in repo root:
 - `teamworks_api_docs.docx` — Teamworks AMS v1 API (OpenAPI excerpts for
   `usersynchronise` and `eventimport`)
 - `teamworks_event_read_endpoints.md` — `synchronise` (event) and
-  `eventsearch` OpenAPI excerpts, pasted later once dedup design needed them
+  `eventsearch` OpenAPI excerpts, pasted once dedup design needed them;
+  `synchronise` is the one actually used (see below), `eventsearch`'s
+  excerpt is kept for history only
 - `AMS_EVENTIMPORT_NOTES.md` — field-tested notes from a prior AMS integration
   (`usss-mocap`) covering gotchas not in the official docs
 
@@ -160,27 +163,48 @@ custom label).
   data that should have produced ~105). **Batch into the fewest events that
   make semantic sense.**
 
-**`POST /api/v1/eventsearch`** — read path used for dedup (see "Dedup /
-idempotency" below), not `synchronise`: the docs explicitly recommend
-`synchronise` when you're maintaining a local cache, and `eventsearch` when
-you need server-side date filtering without one — the latter is exactly
-this design once the local state file was dropped.
-- Request: `formNames` (array, exact match), `startDate`/`finishDate`
-  (`dd/mm/yyyy`), `userIds` (array of ints), pagination via top-level
-  `{"paginate": true, "cursor": "..."}` (omit `cursor` on the first page).
-- Response: `{"events": [...]}` plus a next-page cursor — **the source docs
-  disagree with themselves on this field's name**: the prose says
-  `next_cursor`, the OpenAPI schema in the same doc names it `cursor`. See
-  `teamworks_event_read_endpoints.md` for the exact excerpt. Code accepts
-  either (`response.get("next_cursor") or response.get("cursor")`) rather
-  than betting on one.
-- **Per-event shape beyond the numeric `id` field is undocumented** — the
-  OpenAPI excerpt doesn't say how a custom field like our `Vitruve ID`
-  appears in a returned event. Extraction is defensive: try the field name
-  as a direct key, then fall back to a recursive scan of the whole event
-  object for the exact string value. This is the single biggest unverified
-  assumption in the whole integration — see the Dedup section for how to
-  check it on the first live run.
+**`POST /api/v1/synchronise`** (event, not `usersynchronise`) — read path
+used for dedup (see "Dedup / idempotency" below). **Course-corrected from
+the original plan:** this doc originally picked `/api/v1/eventsearch`
+instead, reasoning that Teamworks' own docs recommend `synchronise` for a
+local-cache pattern and `eventsearch` for server-side date filtering
+without one. In practice, a real tested request/response pair (provided
+directly, not from the OpenAPI excerpt) showed `/api/v1/synchronise` is
+what actually works for this — code now calls that endpoint. `eventsearch`
+was never confirmed against a live call and is no longer used; the OpenAPI
+excerpt for it is kept in `teamworks_event_read_endpoints.md` for history
+only.
+- Request (confirmed): `formName` (singular string, exact match),
+  `startDate` (`dd/mm/yyyy`) — we use 8 days back from run date — and
+  `userIds` (array of ints, **mandatory**: omitting it returns no events
+  for anyone, not "all events", so the code always short-circuits rather
+  than ever calling without one). Pagination, per the OpenAPI excerpt (not
+  yet exercised by a real multi-page response): omit `pagination` on the
+  first page, then send `{"pagination": {"paginate": true, "cursor":
+  "..."}}` on subsequent pages.
+- Response (confirmed): events live under a top-level `"export"` key —
+  `{"export": {"events": [...]}}` — alongside a top-level
+  `lastSynchronisationTimeOnServer` we don't use (this design never
+  persists it — see "As implemented" below). The pagination cursor's exact
+  location on this endpoint isn't confirmed beyond a single-page real
+  example, so code checks both a top-level `cursor` and an `export`-nested
+  one rather than betting on one.
+- **Per-event custom-field shape is now confirmed**, not guessed: each
+  event's `rows[0]["pairs"]` (row 0 = event-level fields) contains
+  `{"key": "Vitruve ID", "value": "..."}` — exactly matching how
+  `transform.build_event_payload` writes it. Extraction now tries that
+  location first, falling back to a recursive scan of the whole event
+  object only as a safety net against a future shape change. This closes
+  out what was previously flagged as the single biggest unverified
+  assumption in the whole integration.
+- **Observed but not yet accounted for:** the real example's `rows[0]`
+  also contained `Sex`, `DOB`, and `Age` pairs we never send via
+  `eventimport` — likely default Teamworks profile fields the form (or
+  platform) auto-attaches, not something our code manages. Worth
+  confirming with whoever administers the form; in the meantime, note DOB
+  is PII — nothing in this pipeline logs full event dumps (only IDs/counts
+  — see Observability), and the diagnostic script below writes raw events
+  only to the gitignored `samples/` directory, never to source control.
 
 ## Proposed architecture
 
@@ -194,7 +218,7 @@ this design once the local state file was dropped.
   `A360_PASSWORD`), scoped to read/write only the Vitruve VBT form plus
   roster-read (see caveat above).
 - **State persistence**: none — no local file, no external DB. Dedup is
-  answered fresh every run by querying Teamworks' own `eventsearch`
+  answered fresh every run by querying Teamworks' own `synchronise`
   endpoint for what's already there. See "Dedup / idempotency" below for
   the full reasoning and the one real risk this carries.
 
@@ -376,20 +400,30 @@ never assume a fixed set per `Type`.
 state file (`state/dedup_state.json`) as the dedup source of truth, with
 row-count comparison to detect late-arriving reps and an update-via-
 `existingEventId` path. That's been replaced with a simpler, self-healing
-design once Teamworks' `/api/v1/eventsearch` docs were in hand — see below.
-The old row-count/state-file reasoning is kept here only as history, not as
-the current design.
+design that queries Teamworks itself fresh every run. The old
+row-count/state-file reasoning is kept here only as history, not as the
+current design.
+
+**Also superseded (endpoint choice):** the stateless redesign originally
+planned to use `/api/v1/eventsearch` for the existence check, reasoning
+from Teamworks' own docs about local-cache vs. server-side-filtering
+patterns. A real tested request/response pair showed that reasoning didn't
+hold in practice — `/api/v1/eventsearch` was never actually confirmed
+against a live call, and `/api/v1/synchronise` is what verifiably works.
+Code uses `synchronise`; the paragraphs below describe the current,
+corrected design.
 
 **As implemented (`vitruve_sync/teamworks_client.py::find_existing_unit_ids`,
 called once per run from `main.py`):** no local state at all. Each run:
 
 1. Resolves athlete matches and computes this run's candidate unit IDs
    (`f"{workoutId}:{exerciseId}"`) as before.
-2. Makes **one** `POST /api/v1/eventsearch` call — `formNames: ["Vitruve
-   VBT"]`, `userIds` scoped to this run's matched athletes, `startDate`/
-   `finishDate` covering an 8-day-back / 1-day-ahead window (wider than
-   Vitruve's own `last-7days` pull, as a buffer against timezone edge
-   cases) — and collects every returned event's `Vitruve ID` value.
+2. Makes **one** `POST /api/v1/synchronise` call — `formName: "Vitruve
+   VBT"`, `userIds` scoped to this run's matched athletes (mandatory on
+   this endpoint — omitting it returns no events for anyone, not "all
+   events"), `startDate` 8 days back (wider than Vitruve's own
+   `last-7days` pull, as a buffer against timezone edge cases) — and
+   collects every returned event's `Vitruve ID` value from `rows[0]["pairs"]`.
 3. Any candidate unit already found there is **skipped**; everything else
    is created fresh via `eventimport` (never with `existingEventId` — this
    design only ever creates, it never updates an existing event).
@@ -406,22 +440,19 @@ treated as a data-quality anomaly to log/alert on rather than solve (see
 finding 6), this was judged an acceptable simplification, but it is a real
 behavior change from "resend full state on change" to "first import wins."
 
-**Unverified risk, flagged for the first live smoke test:** `eventsearch`'s
-OpenAPI excerpt only documents each returned event's numeric `id` field —
-it does not document how a custom event-level field like `Vitruve ID`
-appears in the response (a flat key? nested under a rows/answers
-structure?). `_find_candidate_unit_id` handles this defensively: try
-`event["Vitruve ID"]` directly, then fall back to a recursive scan of the
-whole event object for the exact string value (robust to an unknown shape,
-since we already know the finite set of values we're looking for rather
-than needing to parse an unknown one). **This must be confirmed on the
-first live run** — if `eventsearch` doesn't actually surface the field in
-a way this can find, every run would see "nothing exists yet" and create a
-duplicate event every 30 minutes, which is a worse failure mode than the
-state-file approach's "only breaks if the file is lost." Check this
-specifically before turning the cron on: run once, then run again shortly
-after, and confirm the second run's log shows the units from the first run
-as already-existing, not re-written.
+**Previously flagged as the single biggest unverified risk — now
+confirmed:** a real `synchronise` request/response pair (real endpoint,
+fake data, structure confirmed accurate) showed each event's custom
+fields live in `rows[0]["pairs"]` as `{"key": "Vitruve ID", "value":
+"..."}` — not a flat top-level key, and not under `eventsearch` at all.
+`_find_candidate_unit_id` now checks that confirmed location first, with
+the old defensive recursive scan kept only as a fallback against a future
+shape change. **Still worth a live end-to-end check before turning the
+cron on**, since this confirms the read-side shape but not yet a full
+write-then-read round trip in production: run `workflow_dispatch` once,
+then use `scripts/pull_teamworks_events.py` (or run `workflow_dispatch`
+again) to confirm the second pass sees the first run's units as
+already-existing, not re-created.
 
 ## Credentials
 
@@ -440,14 +471,15 @@ as already-existing, not re-written.
   `https://usopc.smartabase.com/athlete360-usss`, form name `Vitruve VBT`,
   AMS field name constants, `LOCAL_TIMEZONE = "America/Denver"` (assumed —
   confirm against a real smoke test), `VITRUVE_DATE_RANGE = "last-7days"`,
-  `TEAMWORKS_SEARCH_LOOKBACK_DAYS` / `_LOOKAHEAD_DAYS` for the eventsearch
-  dedup window.
+  `TEAMWORKS_SEARCH_LOOKBACK_DAYS` for the `synchronise` dedup window's
+  `startDate`.
 - `vitruve_client.py` / `teamworks_client.py` — stdlib `urllib` only, no
   external dependencies. All v1 Teamworks endpoints require
   `?informat=json&format=json` on every call (in the OpenAPI spec, easy to
   miss) — baked into `TeamworksClient._post`. `teamworks_client.py` also
-  holds `find_existing_unit_ids` (the eventsearch-based dedup check) and its
-  defensive extraction helpers — see "Dedup / idempotency" above.
+  holds `find_existing_unit_ids` (the `synchronise`-based dedup check,
+  confirmed shape) and its extraction helpers — see "Dedup / idempotency"
+  above.
 - `matching.py` — full-name join per "Athlete matching" above.
 - `transform.py` — `KNOWN_METRIC_FIELDS` is the live 22-metric AMS column
   whitelist; the 13 excluded metrics are commented out inline, ready to
@@ -464,8 +496,8 @@ as already-existing, not re-written.
   run on the repo's default branch** — this won't fire until merged there.
   `workflow_dispatch` works from any branch that has the file, so it's
   usable for a manual smoke test before merging.
-- `tests/` — 17 unit tests against synthetic fixtures (no real athlete
-  data), covering matching, transform, and the eventsearch dedup extraction
+- `tests/` — 18 unit tests against synthetic fixtures (no real athlete
+  data), covering matching, transform, and the synchronise dedup extraction
   logic in isolation. Verified separately with a full `main.run()` smoke
   test using mocked Vitruve/Teamworks clients (not committed as a test — no
   real API access in the environment this was built in) confirming the
@@ -475,14 +507,15 @@ as already-existing, not re-written.
 **Deliberately not implemented in v1** (see "Status" above): the manual
 mapping-form fallback for unresolved athlete names.
 
-**Before turning the schedule on:** this has never been run against the
-real Vitruve/Teamworks APIs. Trigger one `workflow_dispatch` run by hand
-first, then run it again shortly after and confirm the second run's log
-shows the first run's units as already-existing (not re-written) — this is
-the eventsearch shape assumption from the Dedup section, and it's the
-single biggest thing that could be wrong. Per the field notes, a wrong
-assumption caught early is cheap; the same mistake repeated every 30
-minutes into a live AMS instance is not.
+**Before turning the schedule on:** the dedup read path's shape is now
+confirmed (see "Dedup / idempotency"), but the pipeline as a whole —
+including the `eventimport` write path — has never been run against the
+real Vitruve/Teamworks APIs end to end. Trigger one `workflow_dispatch` run
+by hand first, then run it again shortly after and confirm the second
+run's log shows the first run's units as already-existing (not
+re-written). Per the field notes, a wrong assumption caught early is
+cheap; the same mistake repeated every 30 minutes into a live AMS instance
+is not.
 
 ## Observability
 

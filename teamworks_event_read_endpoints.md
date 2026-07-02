@@ -4,12 +4,19 @@ Pasted directly from `docs.ams.teamworksapp.com` by the user (not part of
 the original `teamworks_api_docs.docx` upload). Kept here for reference
 alongside that file and `AMS_EVENTIMPORT_NOTES.md`.
 
-`/api/v1/eventsearch` is the one actually used in `vitruve_sync/` (for the
-eventsearch-based dedup check — see `CLAUDE.md` "Dedup / idempotency").
-`/api/v1/synchronise` (event) is documented here too since it was
-considered and explicitly not chosen — Teamworks' own docs recommend it for
-local-cache-based reads, whereas `eventsearch` fits our need for
-server-side date filtering without maintaining a cache.
+**Update — corrected after a real tested call:** this doc originally chose
+`/api/v1/eventsearch` for the dedup check, reasoning from Teamworks' own
+docs about local-cache vs. server-side-filtering patterns (below). That
+reasoning didn't hold up against a real request/response pair: **`/api/v1/
+synchronise` is the endpoint that actually works** for this, with
+`formName` (singular) + `startDate` + `userIds` as the request and events
+returned under a top-level `"export"` key — none of which matches either
+endpoint's documented shape below exactly. `/api/v1/eventsearch` was never
+confirmed against a live call and is no longer used anywhere in
+`vitruve_sync/` — its excerpt below is kept for history only. See
+`CLAUDE.md` "Dedup / idempotency" for the current, corrected design and the
+confirmed per-event field shape (`rows[0]["pairs"]`, not a flat key or
+`additionalProperties` sibling of `id`).
 
 ## (v1) Synchronise Event Data
 

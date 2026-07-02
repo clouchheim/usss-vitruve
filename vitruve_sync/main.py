@@ -1,7 +1,7 @@
 """Entrypoint: pull Vitruve, match athletes, transform, dedup, load into
 Teamworks AMS. Run every ~30 min via .github/workflows/vitruve_sync.yml.
 
-Dedup has no local state: each run asks Teamworks itself (via eventsearch)
+Dedup has no local state: each run asks Teamworks itself (via synchronise)
 which of this run's candidate units already have an event, and only writes
 the ones that don't - see teamworks_client.find_existing_unit_ids and
 CLAUDE.md "Dedup / idempotency".
@@ -15,11 +15,7 @@ import sys
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 
-from vitruve_sync.config import (
-    TEAMWORKS_SEARCH_LOOKAHEAD_DAYS,
-    TEAMWORKS_SEARCH_LOOKBACK_DAYS,
-    VITRUVE_DATE_RANGE,
-)
+from vitruve_sync.config import TEAMWORKS_SEARCH_LOOKBACK_DAYS, VITRUVE_DATE_RANGE
 from vitruve_sync.matching import AMBIGUOUS, UNMATCHED, build_name_index, match_athlete
 from vitruve_sync.teamworks_client import TeamworksClient, TeamworksError
 from vitruve_sync.transform import (
@@ -38,8 +34,7 @@ def log(message):
 def _search_window():
     now = datetime.now(timezone.utc)
     start = now - timedelta(days=TEAMWORKS_SEARCH_LOOKBACK_DAYS)
-    finish = now + timedelta(days=TEAMWORKS_SEARCH_LOOKAHEAD_DAYS)
-    return start.strftime("%d/%m/%Y"), finish.strftime("%d/%m/%Y")
+    return start.strftime("%d/%m/%Y")
 
 
 def run():
@@ -90,12 +85,10 @@ def run():
 
     # One standard call per run: ask Teamworks which of these units already
     # have a "Vitruve VBT" event, rather than trusting a local state file.
-    start_date, finish_date = _search_window()
+    start_date = _search_window()
     matched_user_ids = {c["teamworks_user_id"] for c in candidates}
     candidate_unit_ids = {c["unit_id"] for c in candidates}
-    existing_unit_ids = teamworks.find_existing_unit_ids(
-        start_date, finish_date, matched_user_ids, candidate_unit_ids
-    )
+    existing_unit_ids = teamworks.find_existing_unit_ids(start_date, matched_user_ids, candidate_unit_ids)
     log(f"  {len(existing_unit_ids)}/{len(candidate_unit_ids)} candidate units already in Teamworks")
 
     # Pass 2: build and write only the units that don't already exist.

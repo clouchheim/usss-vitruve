@@ -8,11 +8,19 @@ not usable as the join key - see CLAUDE.md). The "users" key is used
 directly, with the old shape-detection heuristic kept only as a fallback in
 case a future API change moves fields around.
 
-eventsearch's per-event shape is NOT confirmed - the OpenAPI excerpt only
-documents the numeric "id" field, not how a custom form field like our
-"Vitruve ID" appears in a returned event. Extraction here is deliberately
-defensive (try a direct key, then a deep search for the exact value) and
-needs verifying on the first live run - see find_existing_unit_ids.
+Dedup existence check confirmed via a real call: contrary to the original
+plan (see CLAUDE.md "Dedup / idempotency"), the endpoint that actually
+works is POST /api/v1/synchronise, not /api/v1/eventsearch - a real
+request/response pair showed formName (singular) + startDate + userIds as
+the request, with events living under response["export"]["events"]. Each
+event's custom fields (e.g. "Vitruve ID") live in rows[0]["pairs"] (row 0 =
+event-level fields, matching how transform.build_event_payload constructs
+them) - confirmed, not guessed. _find_candidate_unit_id tries that
+confirmed location first, then falls back to a deep scan of the whole
+event as a safety net against a future shape change. userIds is mandatory
+on this endpoint - omitting it returns no events for anyone, not "all
+events" - so find_existing_unit_ids always short-circuits rather than ever
+calling out with none.
 """
 
 import base64
@@ -59,15 +67,26 @@ def _walk_strings(node):
             yield from _walk_strings(item)
 
 
+def _extract_vitruve_id(event):
+    """Row 0 holds event-level fields (Exercise Name, Vitruve ID) - confirmed
+    against a real /api/v1/synchronise response.
+    """
+    for row in event.get("rows", []):
+        if row.get("row") == 0:
+            for pair in row.get("pairs", []):
+                if pair.get("key") == FIELD_VITRUVE_ID:
+                    return pair.get("value")
+    return None
+
+
 def _find_candidate_unit_id(event, candidate_unit_ids):
     """Which (if any) of our candidate unit ids appears in this raw event.
 
-    Tries the direct field-name key first (most likely shape for a
-    single-value/event-level field), falling back to a deep scan for the
-    literal string - robust to an unknown nesting shape since we already
-    know the finite set of values we're looking for.
+    Tries the confirmed row 0 / pairs location first, falling back to a
+    deep scan for the literal string - robust to a future shape change
+    since we already know the finite set of values we're looking for.
     """
-    direct = event.get(FIELD_VITRUVE_ID)
+    direct = _extract_vitruve_id(event)
     if direct in candidate_unit_ids:
         return direct
     for value in _walk_strings(event):
@@ -132,15 +151,20 @@ class TeamworksClient:
                 break
         return users
 
-    def find_existing_unit_ids(self, start_date, finish_date, user_ids, candidate_unit_ids):
+    def find_existing_unit_ids(self, start_date, user_ids, candidate_unit_ids):
         """Which of candidate_unit_ids already have a "Vitruve VBT" event in
-        Teamworks within [start_date, finish_date] for the given user_ids.
+        Teamworks from start_date onward, for the given user_ids.
 
         This is the dedup source of truth: Teamworks itself, queried fresh
-        every run via /api/v1/eventsearch, rather than a separately
+        every run via /api/v1/synchronise, rather than a separately
         maintained state file. No result is returned per-event (no
         existingEventId) since this design never updates an existing event,
         only creates new ones for units not yet present - see CLAUDE.md.
+
+        userIds is mandatory on this endpoint (an empty/missing list returns
+        no events for anyone, not "all events"), so an empty user_ids or
+        candidate_unit_ids always short-circuits rather than risking a call
+        that would silently mean something different than intended.
         """
         candidate_set = set(candidate_unit_ids)
         if not candidate_set or not user_ids:
@@ -149,25 +173,26 @@ class TeamworksClient:
         found = set()
         cursor = None
         base_body = {
-            "formNames": [TEAMWORKS_FORM_NAME],
+            "formName": TEAMWORKS_FORM_NAME,
             "startDate": start_date,
-            "finishDate": finish_date,
             "userIds": sorted(user_ids),
-            "paginate": True,
         }
         while True:
             body = dict(base_body)
             if cursor:
-                body["cursor"] = cursor
-            response = self._post("/api/v1/eventsearch", body)
-            for event in response.get("events", []):
+                # Omit `pagination` entirely on the first page, per the
+                # confirmed request shape - only subsequent pages carry it.
+                body["pagination"] = {"paginate": True, "cursor": cursor}
+            response = self._post("/api/v1/synchronise", body)
+            export = response.get("export") or {}
+            for event in export.get("events", []):
                 unit_id = _find_candidate_unit_id(event, candidate_set)
                 if unit_id:
                     found.add(unit_id)
-            # eventsearch's own docs disagree with themselves: the prose says
-            # the response field is "next_cursor", the OpenAPI schema names
-            # it "cursor" - accept either rather than betting on one.
-            cursor = response.get("next_cursor") or response.get("cursor")
+            # Pagination's cursor location on this endpoint isn't confirmed
+            # beyond a single-page real example - check both plausible spots
+            # rather than betting on one.
+            cursor = response.get("cursor") or export.get("cursor")
             if not cursor:
                 break
         return found
