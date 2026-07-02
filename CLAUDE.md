@@ -149,30 +149,32 @@ custom label).
   after the first real sample pull surfaced a case where a workout's
   contents can't be assumed complete/final at first sight).
 
-## Athlete matching — settled on name-cascade, given a real `/users` pull
+## Athlete matching — settled: full name is the ground-truth join key
 
 | Approach | How | Tradeoff |
 |---|---|---|
-| A. Live match via `/users` | Match Vitruve `/users` to Teamworks roster (`usersynchronise`) by email each run | Self-maintaining, but depends on email consistency between systems, and Teamworks' user-object field names/shape aren't documented until we test live |
+| A. Live match via `/users` | Match Vitruve `/users` to Teamworks roster (`usersynchronise`) by email each run | Dead — the real `/users` pull has no `email` field, see below |
 | B. Hardcoded mapping form | Separate Teamworks form: `vitruveUserId → teamworksAthleteId`, maintained manually | No fuzzy-matching risk, needs manual upkeep |
-| C. Name-cascade | Match Vitruve `/users` `name`/`surname` to Teamworks `usersynchronise` first/last name | Same fragility class the prior integration already hit and documented a fix for (see below) |
+| C. Full-name match | Match Vitruve `/users` (`name` + `surname`) to Teamworks `usersynchronise` (first + last name) as one exact-match unit | Settled primary — see below |
 
 **Updated after pulling the real `/users` endpoint:** contrary to the docs'
 example response, the actual org's `/users` records only carry `id`, `name`,
-`surname` — **no `email` field is present.** That kills approach A as primary
-(there's nothing reliable to join on) and the org confirmed we'll match on
-name instead. This is exactly the scenario `AMS_EVENTIMPORT_NOTES.md` already
-covers from the prior AMS integration, so reuse its cascade rather than
-re-deriving it: exact last name (case-insensitive) → narrow by first initial
-→ narrow by full first name. Know its limits going in — no fuzzy matching, no
-accent/unicode normalization, no handling of hyphens/middle names/suffixes,
-and a genuine duplicate name in the org produces an ambiguous "no unique
-match," not a wrong-but-silent one. **Approach B (manual mapping form) is the
-fallback for anything the cascade can't resolve uniquely** — surface those
-cases for a human to resolve rather than guessing. If a Teamworks user object
-ever does turn out to expose an email field once we test `usersynchronise`
-live, prefer it as a first-pass opportunistic match before falling through to
-the name cascade, but don't design around it being there.
+`surname` — **no `email` field is present.** That kills approach A. Decision:
+**(first name, last name) together is the ground-truth join key** — it's the
+highest-fidelity data genuinely common to both systems. Match by comparing
+the normalized (case-insensitive) full-name tuple from Vitruve `/users`
+against Teamworks `usersynchronise` records directly, rather than a
+partial-match cascade — the exact matching implementation (single query vs.
+building an index first) is an implementation detail, but the join key
+itself is the full name pair, not a fallback chain of partial matches.
+Know its limits going in: no fuzzy matching, no accent/unicode
+normalization, no handling of hyphens/middle names/suffixes, and a genuine
+duplicate full name in the org produces an ambiguous "no unique match," not
+a wrong-but-silent one. **Approach B (manual mapping form) is the fallback
+for anything that doesn't resolve uniquely** — surface those cases for a
+human to resolve rather than guessing. If a Teamworks user object ever does
+turn out to expose an email field once we test `usersynchronise` live, that
+would be a legitimate future upgrade, but the design doesn't depend on it.
 
 ## Learnings from first real sample (`/vbt-workouts?date=last-7days` + website CSV export)
 
@@ -242,20 +244,37 @@ The form now exists in Teamworks. Actual field list:
   `eventimport` payload (`startDate`/`finishDate`/`startTime`), derived from
   the exercise's series `completedAt` per finding 6 above, not workout-level
   timestamps.
-- **Table fields:** `Type` (concentric/eccentric), `Set.` (see below), plus
+- **Table fields:** `Type` (concentric/eccentric), `Set` (see below), plus
   22 metric columns, each named exactly `f"{metric} ({unit})"` using
   Vitruve's own metric/unit strings — e.g. `Mean Propulsive Velocity (m/s)`,
   `Mean Power [MPV] (W)`. This is the full 22-metric vocabulary shared by
   both concentric and eccentric reps (confirmed against the 27/22 lists
   above) — **currently excludes 13 concentric-only/jump-only metrics**:
-  `1RM`, `1RM / Body Weight`, the three `Fatigue` metrics, and all 8
-  `Jump *` metrics. These aren't hypothetical gaps — the sampled squat data
-  already had real `1RM`/`1RM / Body Weight` values on some concentric reps
-  that would silently vanish with no error, since a missing column and a
-  blank cell look identical from the API's perspective. Given the stated
-  design principle ("no harm in extra fields, harm in missing ones"), worth
-  adding these 13 now while the form is still being built, rather than
-  discovering the gap later from a loaded lift or a jump-mat session.
+  ```
+  1RM (kg)
+  1RM / Body Weight (%)
+  Fatigue (PV) (%)
+  Fatigue [MPV] (%)
+  Fatigue [MV] (%)
+  Jump Contact Time (ms)
+  Jump Contraction Time (ms)
+  Jump Flight Time (ms)
+  Jump Height (m)
+  Jump Modified RSI (m/s)
+  Jump Net Impulse (N)
+  Jump Positive Impulse (N)
+  Jump RSI (m/s)
+  ```
+  These aren't hypothetical gaps — the sampled squat data already had real
+  `1RM`/`1RM / Body Weight` values on some concentric reps that would
+  silently vanish with no error, since a missing column and a blank cell
+  look identical from the API's perspective. Given the stated design
+  principle ("no harm in extra fields, harm in missing ones"), added to the
+  form. Note the 8 `Jump *` metrics are sourced from the CSV header list,
+  not yet observed in a real API response (this org's sampled sessions had
+  no jump-mat/force-plate exercise), so their exact metric-name strings are
+  unconfirmed against the live API — worth a quick sanity check against a
+  real jump-mat session once one exists.
 
 **Finalized shape: one `eventimport` call per exercise entry, one table row
 per repetition (concentric AND eccentric, not concentric-only as originally
@@ -263,7 +282,7 @@ recommended).** Tagging each row with `Type` sidesteps the eccentric/
 concentric pairing ambiguity from finding 2 entirely — rows are a straight
 1:1 flatten of the `repetitions[]` array, no pairing logic needed.
 
-**`Set.` numbering:** raw `series` UUIDs aren't meaningful to a coach, so
+**`Set` numbering:** raw `series` UUIDs aren't meaningful to a coach, so
 assign ascending integers per exercise (1, 2, 3...) by sorting that
 exercise's `series` by `completedAt` and numbering in order — every
 repetition row carries its parent series' number. Sorting explicitly by
@@ -358,14 +377,16 @@ never assume a fixed set per `Type`.
 `AMS_EVENTIMPORT_NOTES.md` points to `mocap_report_gui/smartabase_client.py`
 in the `usss-mocap` repo as a working reference for v1 auth, paginated user
 lookup, and event submission (`_headers`, `_fetch_all_athletes`,
-`get_athlete_id`, `_post_event`). `get_athlete_id` specifically is now
-directly relevant, not just a pattern to imitate — it already implements the
-same last-name → first-initial → full-first-name cascade we just settled on
-for athlete matching. This session's GitHub access is scoped only to
+`get_athlete_id`, `_post_event`). `get_athlete_id` is worth reviewing once we
+have access — it solves the same "match a name to a Teamworks user" problem,
+though its cascade (last name → first initial → full first name) is a looser
+match than what we've settled on here (exact full-name-tuple match) — reuse
+its auth/pagination plumbing regardless, but don't assume its matching logic
+should be copied as-is. This session's GitHub access is scoped only to
 `usss-vitruve`, so that file hasn't been pulled in directly — worth asking
 the user to copy the relevant functions over (or grant access) once we start
 writing the Teamworks client, rather than re-deriving the same
-already-solved auth/pagination/matching code.
+already-solved auth/pagination code.
 
 ## Org tooling context
 
